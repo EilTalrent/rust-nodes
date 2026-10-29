@@ -13,8 +13,19 @@ The nodes aren't a separate language. They are a **view of real Rust code**. Ope
 ```sh
 git clone https://github.com/EilTalrent/rust-nodes
 cd rust-nodes
-cargo run --release -- examples/demo/src/main.rs
+cargo run --release
 ```
+
+The app opens with a blank window and asks whether you want to add a Rust (`.rs`) source file:
+
+![Start-up prompt](docs/start.png)
+
+* **Open existing .rs…** opens your system's file picker
+* **Create new .rs…** picks a location and creates a hello-world starter file
+* or type a path and press **Open** / **Create new**
+* **Not now** leaves the window blank. You can add a file later with **Browse… / New…** in the toolbar or the **Add a .rs file…** button.
+
+You can also open a file straight away: `cargo run --release -- examples/demo/src/main.rs`. If the file doesn't exist yet, the prompt opens with its path filled in, ready to create.
 
 Then press **▶ Run** in the toolbar. The editor saves, runs `cargo run` in the project that contains the file, and shows the output at the bottom.
 
@@ -69,7 +80,8 @@ Unconnected inputs generate `todo!("unconnected pin")`, so half-finished graphs 
 ## Command line
 
 ```sh
-rust-nodes [FILE.rs]              # open the editor
+rust-nodes                        # open the editor (blank, asks for a .rs file)
+rust-nodes FILE.rs                # open the editor on FILE.rs
 rust-nodes --roundtrip FILE.rs    # parse to a graph and print the regenerated Rust
 rust-nodes --graph FILE.rs        # print the graph as JSON
 ```

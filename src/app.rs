@@ -4,7 +4,7 @@
 use crate::codegen::{generate, Generated};
 use crate::editor::Editor;
 use crate::graph::*;
-use crate::parse::{parse_program, parse_signature};
+use crate::parse::parse_signature;
 use crate::project;
 use eframe::egui;
 use std::collections::HashMap;
@@ -41,32 +41,145 @@ struct App {
     sig_error: Option<String>,
     output: Arc<Mutex<String>>,
     running: Arc<AtomicBool>,
+    /// false until a .rs file has been opened or created: the window starts blank
+    has_file: bool,
+    /// the "add a Rust source file?" prompt
+    show_prompt: bool,
+    prompt_error: Option<String>,
 }
 
 impl App {
     fn new(file: Option<PathBuf>) -> Self {
-        let program = parse_program(STARTER).expect("starter parses");
+        let program = Program { items: vec![] };
         let code = generate(&program);
         let mut app = App {
-            path_text: "src/main.rs".into(),
+            path_text: String::new(),
             path: None,
             program,
             current: vec![],
             editors: HashMap::new(),
             code,
             unsaved: false,
-            status: "New file. Type a path and press Open, or edit and Save.".into(),
+            status: "No file open.".into(),
             sig_text: String::new(),
             sig_error: None,
             output: Arc::new(Mutex::new(String::new())),
             running: Arc::new(AtomicBool::new(false)),
+            has_file: false,
+            show_prompt: true,
+            prompt_error: None,
         };
         if let Some(f) = file {
             app.path_text = f.display().to_string();
-            app.open();
+            if f.exists() {
+                app.open();
+            } else {
+                app.prompt_error = Some(format!("{} doesn't exist yet. Press \"Create new\" to make it.", f.display()));
+            }
         }
+        app.show_prompt = !app.has_file;
         app.select_first();
         app
+    }
+
+    /// Open the file in `path_text`. If it doesn't exist and `create` is set, make it with a hello-world starter.
+    fn open_or_create(&mut self, create: bool) -> Result<(), String> {
+        let path = PathBuf::from(self.path_text.trim());
+        if path.as_os_str().is_empty() {
+            return Err("Type a path to a .rs file first.".into());
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            return Err("That isn't a .rs file.".into());
+        }
+        if !path.exists() {
+            if !create {
+                return Err(format!("{} doesn't exist. Use \"Create new\" to make it.", path.display()));
+            }
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, STARTER).map_err(|e| e.to_string())?;
+        }
+        self.open();
+        if self.has_file { Ok(()) } else { Err(self.status.clone()) }
+    }
+
+    /// Native "open file" dialog.
+    fn browse_open(&mut self) -> Result<(), String> {
+        match rfd::FileDialog::new().add_filter("Rust source", &["rs"]).set_title("Open a Rust source file").pick_file() {
+            Some(p) => {
+                self.path_text = p.display().to_string();
+                self.open_or_create(false)
+            }
+            None => Err("No file chosen. (If no dialog appeared, type a path instead.)".into()),
+        }
+    }
+
+    /// Native "save as" dialog, then create the file with a starter program.
+    fn browse_new(&mut self) -> Result<(), String> {
+        match rfd::FileDialog::new()
+            .add_filter("Rust source", &["rs"])
+            .set_file_name("main.rs")
+            .set_title("Create a new Rust source file")
+            .save_file()
+        {
+            Some(p) => {
+                self.path_text = p.display().to_string();
+                self.open_or_create(true)
+            }
+            None => Err("No file chosen. (If no dialog appeared, type a path instead.)".into()),
+        }
+    }
+
+    fn prompt(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        egui::Modal::new(egui::Id::unique("add-rs-file")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Welcome to rust-nodes");
+            ui.add_space(4.0);
+            ui.label("Do you want to add a Rust (.rs) source file?");
+            ui.add_space(10.0);
+            let mut result = None;
+            ui.horizontal(|ui| {
+                if ui.button("Open existing .rs…").clicked() {
+                    result = Some(self.browse_open());
+                }
+                if ui.button("✚ Create new .rs…").clicked() {
+                    result = Some(self.browse_new());
+                }
+            });
+            ui.add_space(10.0);
+            ui.label("…or type a path:");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.path_text).code_editor().desired_width(260.0).hint_text("my_app/src/main.rs"));
+                if ui.button("Open").clicked() {
+                    result = Some(self.open_or_create(false));
+                }
+                if ui.button("Create new").clicked() {
+                    result = Some(self.open_or_create(true));
+                }
+            });
+            ui.weak("Tip: put the file in a cargo project (like my_app/src/main.rs) so ▶ Run works.");
+            match result {
+                Some(Ok(())) => close = true,
+                Some(Err(e)) => self.prompt_error = Some(e),
+                None => {}
+            }
+            if let Some(e) = &self.prompt_error {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e);
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Not now").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            self.show_prompt = false;
+            self.prompt_error = None;
+        }
     }
 
     fn select_first(&mut self) {
@@ -87,6 +200,7 @@ impl App {
             Ok(loaded) => {
                 self.program = loaded.program;
                 self.status = loaded.note;
+                self.has_file = true;
                 self.path = Some(path);
                 self.editors.clear();
                 self.unsaved = false;
@@ -215,19 +329,32 @@ impl eframe::App for App {
                 ui.strong("rust-nodes");
                 ui.separator();
                 ui.label("File:");
-                ui.add(egui::TextEdit::singleline(&mut self.path_text).desired_width(360.0).code_editor());
+                ui.add(egui::TextEdit::singleline(&mut self.path_text).desired_width(320.0).code_editor());
                 if ui.button("Open").clicked() {
-                    self.open();
+                    if let Err(e) = self.open_or_create(false) {
+                        self.status = e;
+                    }
                 }
-                if ui.button(if self.unsaved { "Save*" } else { "Save" }).clicked() {
+                if ui.button("Browse…").on_hover_text("Open a .rs file").clicked() {
+                    if let Err(e) = self.browse_open() {
+                        self.status = e;
+                    }
+                }
+                if ui.button("✚ New…").on_hover_text("Create a new .rs file").clicked() {
+                    if let Err(e) = self.browse_new() {
+                        self.status = e;
+                    }
+                }
+                let has = self.has_file;
+                if ui.add_enabled(has, egui::Button::new(if self.unsaved { "Save*" } else { "Save" })).clicked() {
                     self.save();
                 }
                 ui.separator();
                 let busy = self.running.load(Ordering::SeqCst);
-                if ui.add_enabled(!busy, egui::Button::new("Check")).on_hover_text("Save, then cargo check").clicked() {
+                if ui.add_enabled(has && !busy, egui::Button::new("Check")).on_hover_text("Save, then cargo check").clicked() {
                     self.cargo("check", &ctx);
                 }
-                if ui.add_enabled(!busy, egui::Button::new("▶ Run")).on_hover_text("Save, then cargo run").clicked() {
+                if ui.add_enabled(has && !busy, egui::Button::new("▶ Run")).on_hover_text("Save, then cargo run").clicked() {
                     self.cargo("run", &ctx);
                 }
                 if busy {
@@ -250,6 +377,27 @@ impl eframe::App for App {
                 ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap_mode(egui::TextWrapMode::Extend));
             });
         });
+
+        if self.show_prompt {
+            self.prompt(&ctx);
+        }
+
+        if !self.has_file {
+            // Blank application: nothing open yet.
+            egui::CentralPanel::default_margins().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.35);
+                    ui.heading("No file open");
+                    ui.add_space(6.0);
+                    ui.weak("Add a Rust source file to start editing it as nodes.");
+                    ui.add_space(10.0);
+                    if ui.button("Add a .rs file…").clicked() {
+                        self.show_prompt = true;
+                    }
+                });
+            });
+            return;
+        }
 
         egui::Panel::left("functions").resizable(true).default_size(240.0).show(ui, |ui| {
             ui.heading("Functions");

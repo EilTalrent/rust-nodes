@@ -14,3 +14,4 @@ prettyplease = "0.2"
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 serde = { version = "1", features = ["derive"] }
+rfd = "0.17.2"
