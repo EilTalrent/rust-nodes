@@ -425,6 +425,22 @@ impl Editor {
             let label_font = FontId::proportional(11.5 * z);
             let label_color = Color32::from_gray(200);
 
+            // the statement's `//` comments, shown above it
+            let shown: Vec<String> = comment_display(&node.comment).lines().filter(|l| !l.is_empty()).map(String::from).collect();
+            if !shown.is_empty() {
+                let n = shown.len().min(3);
+                for (i, l) in shown.iter().rev().take(3).enumerate() {
+                    let text = if i == n - 1 && shown.len() > 3 { "…".to_string() } else { format!("// {}", short(l)) };
+                    painter.text(
+                        r.left_top() + Vec2::new(2.0 * z, -(4.0 + i as f32 * 13.0) * z),
+                        Align2::LEFT_BOTTOM,
+                        text,
+                        FontId::proportional(11.0 * z),
+                        Color32::from_rgb(130, 150, 130),
+                    );
+                }
+            }
+
             if let Some(gp) = groups.get(&id) {
                 // proxy pins for wires crossing the group's border (rewire inside the group)
                 for er in gp.ins.iter() {
@@ -970,6 +986,18 @@ impl Editor {
                 ui.weak("No properties.");
             }
         }
+        // comment above the statement
+        if let Some(node) = f.nodes.get_mut(&id) {
+            if node.kind.is_exec() && !matches!(node.kind, NodeKind::Entry | NodeKind::BlockEntry { .. }) {
+                ui.add_space(6.0);
+                ui.label("Comment");
+                let mut text = comment_display(&node.comment);
+                if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(2).desired_width(f32::INFINITY).hint_text("written as // lines above this statement")).changed() {
+                    node.comment = comment_encode(&text, node.comment.starts_with('\n'));
+                    c = true;
+                }
+            }
+        }
         if c {
             f.prune_edges();
         }
@@ -1037,4 +1065,35 @@ fn container_label(k: &NodeKind) -> String {
         return "closure".into();
     }
     t.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\'')).find(|w| !w.is_empty()).unwrap_or("block").to_string()
+}
+
+/// Stored comment entries → plain text for display/editing (without `//`).
+fn comment_display(stored: &str) -> String {
+    stored
+        .lines()
+        .map(|l| {
+            let l = l.trim_start_matches('~').trim();
+            let l = l.strip_prefix("//").map(|x| x.strip_prefix(' ').unwrap_or(x)).unwrap_or(l);
+            l.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_matches('\n')
+        .to_string()
+}
+
+/// Edited text → stored entries (`// line` per line), keeping a blank line above if there was one.
+fn comment_encode(text: &str, blank_above: bool) -> String {
+    let mut out = String::new();
+    if blank_above {
+        out.push('\n');
+    }
+    for l in text.lines() {
+        if l.trim().is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str(&format!("// {}\n", l.trim_end()));
+        }
+    }
+    if out.trim().is_empty() && !blank_above { String::new() } else { out }
 }

@@ -22,6 +22,10 @@ pub struct Program {
 pub enum Item {
     /// Any item we don't turn into a graph, kept verbatim (pretty-printed).
     Raw(String),
+    /// `//` comments that sat between items in the source, kept in place.
+    Comment(String),
+    /// Inner attributes / `//!` docs at the top of the file.
+    Header(String),
     Func(FnGraph),
     /// `impl ... { ... }` block. `header` is everything before the `{`.
     Impl { header: String, items: Vec<Item> },
@@ -51,6 +55,13 @@ pub struct Node {
     /// `Some((template_node, hole))` = inside that template's block hole.
     #[serde(default)]
     pub scope: Scope,
+    /// `//` comments and blank lines written above this statement in the source, one entry per line:
+    /// "" = blank line, "~// x" = comment at the end of the previous line, otherwise the comment text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    /// Comments after this statement, before the end of its block.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment_after: String,
 }
 
 pub type Scope = Option<(NodeId, usize)>;
@@ -67,6 +78,43 @@ pub struct Hole {
     pub bare_ok: bool,
     /// Lowest operator precedence that fits here without parentheses.
     pub prec: u8,
+}
+
+/// Show `#[__rn_comment("// x")]` lines (comments between match arms) as plain comments.
+pub fn show_comment_attrs(code: &str) -> String {
+    if !code.contains("__rn_comment") {
+        return code.to_string();
+    }
+    code.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("#[__rn_comment(") {
+                let indent = &l[..l.len() - t.len()];
+                let (Some(a), Some(b)) = (t.find('"'), t.rfind('"')) else { return l.to_string() };
+                match syn::parse_str::<syn::LitStr>(&t[a..=b]) {
+                    Ok(lit) => format!("{indent}{}", lit.value().trim_start_matches('~')),
+                    Err(_) => l.to_string(),
+                }
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line, at most ~40 characters, for node titles (long string literals etc.).
+pub fn short(s: &str) -> String {
+    let first = s.lines().next().unwrap_or("");
+    let multi = s.lines().nth(1).is_some();
+    let mut out: String = first.chars().take(40).collect();
+    if multi || first.chars().count() > 40 {
+        out.push('…');
+        if s.starts_with('"') && !out.ends_with('"') {
+            out.push('"');
+        }
+    }
+    out
 }
 
 /// Marker for hole `i` inside template code.
@@ -290,11 +338,11 @@ impl NodeKind {
             Continue => "Continue".into(),
             Return => "Return".into(),
             RawStmt { .. } => "Rust statement".into(),
-            Literal { code } => code.clone(),
-            Var { name } => name.clone(),
+            Literal { code } => short(code),
+            Var { name } => short(name),
             Binary { op } => op.clone(),
             Unary { op } => op.trim().to_string(),
-            Call { path, .. } => format!("{path}()"),
+            Call { path, .. } => format!("{}()", short(path)),
             Method { name, .. } => format!(".{name}()"),
             Macro { name, .. } => format!("{name}!"),
             Field { name } => format!(".{name}"),
@@ -330,7 +378,7 @@ impl NodeKind {
         match self {
             NodeKind::RawStmt { code } | NodeKind::RawExpr { code } => Some(code.clone()),
             NodeKind::Template { code, holes } | NodeKind::TemplateStmt { code, holes } => {
-                let mut c = code.clone();
+                let mut c = show_comment_attrs(code);
                 for i in 0..holes.len() {
                     c = c.replace(&hole_marker(i), &hole_label(i));
                 }
@@ -415,7 +463,7 @@ impl FnGraph {
     pub fn add_in(&mut self, kind: NodeKind, pos: [f32; 2], scope: Scope) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Node { kind, pos, scope });
+        self.nodes.insert(id, Node { kind, pos, scope, comment: String::new(), comment_after: String::new() });
         id
     }
 
@@ -606,7 +654,7 @@ impl Program {
                 match it {
                     Item::Func(f) => out.push((prefix.clone(), f)),
                     Item::Impl { items, .. } => walk(items, prefix, out),
-                    Item::Raw(_) => {}
+                    _ => {}
                 }
                 prefix.pop();
             }

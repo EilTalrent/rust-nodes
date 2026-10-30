@@ -642,7 +642,7 @@ impl eframe::App for App {
             }
             ui.weak("Parameters show up as outputs on the Entry node.");
             ui.separator();
-            let others = self.program.items.iter().filter(|i| matches!(i, Item::Raw(_))).count();
+            let others = self.program.items.iter().filter(|i| matches!(i, Item::Raw(_) | Item::Comment(_))).count();
             ui.weak(format!("{others} other item(s) (structs, enums, use, ...) are kept as code."));
         });
 

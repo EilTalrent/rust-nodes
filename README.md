@@ -130,6 +130,7 @@ Collapsing a loop or `if` automatically brings along its body and the value node
 * **Scroll** → zoom
 * **Inspector** (right) edits the selected node: names, operators, argument counts, raw code…
 * **Generated Rust** (right) updates live as you edit
+* A statement's `//` comment is shown above its node; edit it under **Comment** in the inspector
 * **Left panel**: functions in the file, add/delete functions, edit the signature (parameters become Entry outputs)
 * **Check / Run** → `cargo check` / `cargo run`. The file must be inside a cargo project.
 
@@ -161,7 +162,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 
 ## Known limitations
 
-* Comments inside function bodies are lost when the editor saves. Doc comments and attributes on items are kept.
+* Comments are kept: between items, between `impl` methods, above and at the end of statements (shown above the node and editable in the inspector), and between `match` arms. Blank lines between statements are kept too. Comments *inside* a single expression (e.g. in the middle of a long method chain or argument list) are still dropped.
+* Macros other than the standard expression ones (`println!`, `format!`, `vec!`, `assert_eq!`, `write!`, ...) are kept exactly as written, since their arguments may be patterns or other syntax (`matches!`, `json!`, ...).
 * A value node wired into several places is written out at each use. Use a `let` to compute something once.
 * Inside templates, names bound by patterns and used in guard expressions (e.g. `*w > 0.0`) are matched by name, not by wire. The same goes for calling a closure stored in a variable (`add(1, 2)`).
 * Editing a template's code by hand works, but keep the `⟦n⟧` hole markers.

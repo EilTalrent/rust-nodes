@@ -382,3 +382,44 @@ fn compiler_found_texts() {
     assert_eq!(type_from_found("struct `HashMap<char, usize>`").unwrap(), "HashMap<char, usize>");
     assert!(type_from_found("closure").is_err());
 }
+
+// ---------------- keeping comments and exact text ----------------
+
+#[test]
+fn comments_roundtrip() {
+    check_file("examples/samples/comments.rs");
+    let src = std::fs::read_to_string("examples/samples/comments.rs").unwrap();
+    let out = roundtrip(&src);
+    // every ordinary comment comes back
+    for line in src.lines() {
+        if let Some(pos) = line.find("//") {
+            let c = &line[pos..];
+            if !c.starts_with("///") && !c.starts_with("//!") {
+                assert!(out.contains(c), "lost comment {c:?}\n{out}");
+            }
+        }
+    }
+    assert!(!out.contains("__rn_"), "marker leaked:\n{out}");
+    // the string with escaped newlines is untouched, and so are macros we can't split
+    assert!(out.contains("const HELP: &str = \"line one \\\n    continues here\\n\\\n    and here\";"), "{out}");
+    assert!(out.contains("matches!(total, 1..=10 | 20)"), "{out}");
+    assert!(out.contains("} else if let Some(v) = m.get(&3) {"), "{out}");
+    assert!(out.contains("self.x + self.y // end-of-line comment"), "{out}");
+    assert!(out.contains("1 => \"one\", // just one"), "{out}");
+    assert!(out.contains("Point { x, y }"), "shorthand kept: {out}");
+    assert_eq!(run_rust(&out, "comments"), run_rust(&src, "comments-orig"));
+}
+
+#[test]
+fn assignment_in_match_arm_is_valid() {
+    // used to come out as `=> a = 1;,`
+    let out = roundtrip("fn f(x: i32) { let mut a = 0; match x { 0 => a = 1, _ => a = 2 } println!(\"{}\", a); }");
+    assert!(syn::parse_file(&out).is_ok(), "{out}");
+}
+
+#[test]
+fn long_guarded_arms_keep_their_commas() {
+    let src = "fn f(kind: u32, some_long_condition_name: bool, another_rather_long_flag: bool) -> u32 {\n    let mut dragging = 0;\n    match kind {\n        1 if some_long_condition_name && another_rather_long_flag => dragging = 1,\n        2 => dragging = 2,\n        _ => {}\n    }\n    dragging\n}\nfn main() { println!(\"{}\", f(1, true, true)); }\n";
+    let out = roundtrip(src);
+    assert_eq!(run_rust(&out, "arms"), run_rust(src, "arms-orig"));
+}
