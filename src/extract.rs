@@ -585,3 +585,86 @@ fn helper_top(h: &FnGraph, id: NodeId) -> bool {
 pub fn function_names(p: &Program) -> Vec<String> {
     p.functions().iter().map(|(_, f)| f.name.clone()).collect()
 }
+
+// ---------------------------------------------------------------------------
+// Asking the compiler for types.
+
+/// What a probe is asking about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeTarget {
+    Param(usize),
+    Output(usize),
+}
+
+pub fn probe_var(i: usize) -> String {
+    format!("__rn_probe_{i}")
+}
+
+/// A copy of the program's code with `let __rn_probe_N: () = value;` lines added
+/// just before the group (for parameters) and just after it (for return values).
+/// The compiler rejects each one with "expected `()`, found `TYPE`".
+pub fn probe_code(program: &Program, fn_path: &[usize], plan: &Plan) -> Result<(String, Vec<ProbeTarget>), String> {
+    let mut program = program.clone();
+    let f = program.function_mut(fn_path).ok_or("function not found")?;
+    let scope = f.nodes.get(&plan.first).ok_or("group changed, reopen the dialog")?.scope;
+    let mut targets = vec![];
+    let make = |f: &mut FnGraph, src: (NodeId, usize), t: ProbeTarget, targets: &mut Vec<ProbeTarget>| -> NodeId {
+        let i = targets.len();
+        targets.push(t);
+        let hole = Hole { block: false, binders: vec![], bare_ok: false, prec: 0 };
+        let code = format!("let {}: () = {};", probe_var(i), hole_marker(0));
+        let id = f.add_in(NodeKind::TemplateStmt { code, holes: vec![hole] }, [0.0, 0.0], scope);
+        f.connect_data(src.0, src.1, id, 0);
+        id
+    };
+    // before the group
+    let before: Vec<NodeId> = plan.params.iter().enumerate().map(|(k, p)| make(f, p.src, ProbeTarget::Param(k), &mut targets)).collect();
+    if let Some(&head) = before.first() {
+        for w in before.windows(2) {
+            f.connect_exec(w[0], 0, w[1]);
+        }
+        for &(from, pin) in &plan.exec_in {
+            f.connect_exec(from, pin, head);
+        }
+        f.connect_exec(*before.last().unwrap(), 0, plan.first);
+    }
+    // after the group
+    let after: Vec<NodeId> = plan.outputs.iter().enumerate().map(|(k, o)| make(f, o.src, ProbeTarget::Output(k), &mut targets)).collect();
+    if let Some(&head) = after.first() {
+        for w in after.windows(2) {
+            f.connect_exec(w[0], 0, w[1]);
+        }
+        let pin = f.nodes[&plan.last].kind.next_pin().unwrap_or(0);
+        f.connect_exec(plan.last, pin, head);
+        if let Some(t) = plan.exec_out {
+            f.connect_exec(*after.last().unwrap(), 0, t);
+        }
+    }
+    let g = crate::codegen::generate(&program);
+    if let Some(e) = g.error {
+        return Err(format!("couldn't build the probe program: {e}"));
+    }
+    Ok((g.code, targets))
+}
+
+/// Turn the compiler's "found ..." text into a type to write in a signature.
+/// Returns Err with a note for things that can't be named (closures, ...).
+pub fn type_from_found(found: &str) -> Result<String, String> {
+    let f = found.trim();
+    if let Some(t) = f.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
+        if t.contains("{closure") || t.contains("{async") || t.contains("impl ") {
+            return Err(format!("`{t}` can't be written as a type"));
+        }
+        return Ok(t.replace("{integer}", "i32").replace("{float}", "f64"));
+    }
+    match f {
+        "integer" => Ok("i32".into()),
+        "floating-point number" => Ok("f64".into()),
+        "closure" => Err("a closure can't be written as a type (use `impl Fn(..)` by hand)".into()),
+        // older/other wordings: "struct `Vec<i32>`", "enum `Option<u8>`", "reference `&str`"
+        other => match other.split_once('`') {
+            Some((_, rest)) => type_from_found(&format!("`{}", rest)),
+            None => Err(format!("compiler said: {other}")),
+        },
+    }
+}

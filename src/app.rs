@@ -46,6 +46,7 @@ struct App {
     has_file: bool,
     /// "Extract function" dialog
     extract: Option<ExtractDialog>,
+    pending_ask: bool,
     /// the "add a Rust source file?" prompt
     show_prompt: bool,
     prompt_error: Option<String>,
@@ -70,6 +71,7 @@ impl App {
             running: Arc::new(AtomicBool::new(false)),
             has_file: false,
             extract: None,
+            pending_ask: false,
             show_prompt: true,
             prompt_error: None,
         };
@@ -321,7 +323,13 @@ impl App {
     fn take_extract_request(&mut self, path: &[usize]) {
         let Some(g) = self.editors.get_mut(path).and_then(|e| e.extract_request.take()) else { return };
         let Some(f) = self.program.function_mut(path) else { return };
-        self.extract = Some(ExtractDialog { fn_path: path.to_vec(), plan: extract::plan(f, g) });
+        let plan = extract::plan(f, g);
+        let unknown = plan.as_ref().is_ok_and(|p| p.params.iter().any(|x| x.ty.is_empty()) || p.outputs.iter().any(|x| x.ty.is_empty()));
+        self.extract = Some(ExtractDialog { fn_path: path.to_vec(), plan, asking: None, notes: vec![] });
+        // some types couldn't be guessed: ask the compiler straight away
+        if unknown {
+            self.pending_ask = true;
+        }
     }
 
     fn mark_changed(&mut self) {
@@ -330,13 +338,70 @@ impl App {
     }
 }
 
+type ProbeAnswer = Result<Vec<(extract::ProbeTarget, Result<String, String>)>, String>;
+
 struct ExtractDialog {
     fn_path: Vec<usize>,
     plan: Result<extract::Plan, String>,
+    /// answer from a background compiler run, when one is in progress
+    asking: Option<Arc<Mutex<Option<ProbeAnswer>>>>,
+    /// what the compiler run told us (shown under the fields)
+    notes: Vec<String>,
 }
 
 impl App {
+    /// Start a background compiler run that fills in the dialog's types.
+    fn ask_compiler(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else { return };
+        let Some(dlg) = &mut self.extract else { return };
+        let Ok(plan) = &dlg.plan else { return };
+        match extract::probe_code(&self.program, &dlg.fn_path, plan) {
+            Err(e) => dlg.notes = vec![e],
+            Ok((code, targets)) => {
+                let slot = Arc::new(Mutex::new(None));
+                dlg.asking = Some(slot.clone());
+                dlg.notes.clear();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let answer = crate::compiler::probe_types(&path, &code, targets.len())
+                        .map(|types| targets.into_iter().zip(types).collect());
+                    *slot.lock().unwrap() = Some(answer);
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
     fn extract_dialog(&mut self, ctx: &egui::Context) {
+        // collect a finished compiler answer
+        if let Some(dlg) = &mut self.extract {
+            let done = dlg.asking.as_ref().and_then(|slot| slot.lock().unwrap().take());
+            if let Some(answer) = done {
+                dlg.asking = None;
+                match (answer, &mut dlg.plan) {
+                    (Err(e), _) => dlg.notes = vec![e],
+                    (Ok(list), Ok(plan)) => {
+                        let mut filled = 0;
+                        for (t, ty) in list {
+                            let (name, slot) = match t {
+                                extract::ProbeTarget::Param(k) => (format!("parameter `{}`", plan.params[k].name), &mut plan.params[k].ty),
+                                extract::ProbeTarget::Output(k) => (format!("returned `{}`", plan.outputs[k].name), &mut plan.outputs[k].ty),
+                            };
+                            match ty {
+                                Ok(ty) => {
+                                    *slot = ty;
+                                    filled += 1;
+                                }
+                                Err(why) => dlg.notes.push(format!("{name}: {why}")),
+                            }
+                        }
+                        dlg.notes.insert(0, format!("✔ The compiler filled in {filled} type{}.", if filled == 1 { "" } else { "s" }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut ask = false;
         let Some(dlg) = &mut self.extract else { return };
         let existing = extract::function_names(&self.program);
         let mut close = false;
@@ -389,12 +454,31 @@ impl App {
                         });
                     }
                     ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let busy = dlg.asking.is_some();
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Ask the compiler for types"))
+                            .on_hover_text("Runs cargo check on a scratch copy of your project (your files aren't touched) and reads the real types from its errors.")
+                            .clicked()
+                        {
+                            ask = true;
+                        }
+                        if busy {
+                            ui.spinner();
+                            ui.weak("running cargo check…");
+                        }
+                    });
+                    for n in &dlg.notes {
+                        let color = if n.starts_with('✔') { egui::Color32::from_rgb(120, 200, 140) } else { egui::Color32::from_rgb(230, 160, 90) };
+                        ui.colored_label(color, n);
+                    }
+                    ui.add_space(8.0);
                     ui.label(egui::RichText::new(plan.signature()).monospace().strong());
                     let problems = plan.problems(&existing);
                     for p in &problems {
                         ui.colored_label(egui::Color32::from_rgb(230, 160, 90), format!("• {p}"));
                     }
-                    ui.weak("Types are guessed where possible. Press Check afterwards to let the compiler confirm.");
+                    ui.weak("Types are guessed where possible; the compiler gives the real ones.");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.add_enabled(problems.is_empty(), egui::Button::new("Extract")).clicked() {
@@ -407,6 +491,9 @@ impl App {
                 }
             }
         });
+        if ask {
+            self.ask_compiler(ctx);
+        }
         if run {
             let dlg = self.extract.take().unwrap();
             if let Ok(plan) = dlg.plan {
@@ -487,6 +574,9 @@ impl eframe::App for App {
             self.prompt(&ctx);
         }
 
+        if std::mem::take(&mut self.pending_ask) {
+            self.ask_compiler(&ctx);
+        }
         self.extract_dialog(&ctx);
 
         if !self.has_file {

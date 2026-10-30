@@ -304,3 +304,81 @@ fn extract_refuses_break_of_outside_loop() {
     let (code, _) = extract_stmts(src, 1..2, "count_up").unwrap();
     assert_eq!(run_rust(&code, "loop"), run_rust(src, "loop-orig"));
 }
+
+// ---------------- asking the compiler for types ----------------
+
+const PARTS: &str = r#"fn main() {
+    let text = "a,b,c";
+    let parts = text.split(',').collect::<Vec<_>>();
+    let count = parts.len();
+    let label = format!("{} parts", count);
+    println!("{}", label);
+}
+"#;
+
+/// Group main's statements `range`, ask the compiler for the types, extract, and return the new code.
+fn extract_with_compiler(src: &str, file: &std::path::Path, range: std::ops::Range<usize>, name: &str) -> (String, crate::extract::Plan) {
+    std::fs::write(file, src).unwrap();
+    let mut p = parse_program(src).unwrap();
+    let path = p.functions().into_iter().find(|(_, f)| f.name == "main").unwrap().0;
+    let f = p.function_mut(&path).unwrap();
+    let chain = top_chain(f);
+    let g = f.collapse(&chain[range], name).unwrap();
+    let mut plan = crate::extract::plan(f, g).unwrap();
+    plan.name = name.to_string();
+    let (code, targets) = crate::extract::probe_code(&p, &path, &plan).unwrap();
+    let types = crate::compiler::probe_types(file, &code, targets.len()).unwrap();
+    for (t, ty) in targets.iter().zip(types) {
+        let ty = ty.expect("compiler gave a type");
+        match *t {
+            crate::extract::ProbeTarget::Param(k) => plan.params[k].ty = ty,
+            crate::extract::ProbeTarget::Output(k) => plan.outputs[k].ty = ty,
+        }
+    }
+    crate::extract::apply(&mut p, &path, &plan).unwrap();
+    (generate(&p).code, plan)
+}
+
+#[test]
+fn compiler_types_with_rustc() {
+    let dir = std::env::temp_dir().join(format!("rn-probe-rustc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.rs");
+    // `parts` comes from a turbofish collect: no way to guess, the compiler must say Vec<&str>
+    let mut plan_before = parse_program(PARTS).unwrap();
+    let path = plan_before.functions().into_iter().find(|(_, f)| f.name == "main").unwrap().0;
+    let f = plan_before.function_mut(&path).unwrap();
+    let chain = top_chain(f);
+    let g = f.collapse(&chain[2..3], "x").unwrap();
+    assert_eq!(crate::extract::plan(f, g).unwrap().params[0].ty, "", "guessing should fail here");
+
+    let (code, plan) = extract_with_compiler(PARTS, &file, 2..3, "count_parts");
+    assert_eq!(plan.signature(), "fn count_parts(parts: Vec<&str>) -> usize");
+    assert_eq!(run_rust(&code, "probe-rustc"), run_rust(PARTS, "probe-rustc-orig"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compiler_types_with_cargo() {
+    let dir = std::env::temp_dir().join(format!("rn-probe-cargo-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"probe_test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n").unwrap();
+    let file = dir.join("src").join("main.rs");
+    // returning `parts` (a Vec<&str>) and taking `text` (&str)
+    let (code, plan) = extract_with_compiler(PARTS, &file, 1..2, "split_parts");
+    assert_eq!(plan.signature(), "fn split_parts(text: &str) -> Vec<&str>");
+    assert_eq!(run_rust(&code, "probe-cargo"), run_rust(PARTS, "probe-cargo-orig"));
+    // the user's project folder was not modified
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), PARTS);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compiler_found_texts() {
+    use crate::extract::type_from_found;
+    assert_eq!(type_from_found("integer").unwrap(), "i32");
+    assert_eq!(type_from_found("floating-point number").unwrap(), "f64");
+    assert_eq!(type_from_found("`Vec<{integer}>`").unwrap(), "Vec<i32>");
+    assert_eq!(type_from_found("struct `HashMap<char, usize>`").unwrap(), "HashMap<char, usize>");
+    assert!(type_from_found("closure").is_err());
+}

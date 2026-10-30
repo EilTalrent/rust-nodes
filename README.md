@@ -106,12 +106,14 @@ A group can become a **real Rust function**: right-click it → **ƒ Extract fun
 * Values flowing **into** the group become **parameters**. A variable that the group changes (assigned to, `&mut`, or a mutating method call on a `let mut`) is passed as `&mut`, and uses inside become `*name`.
 * Values used **after** the group are **returned**. Several are returned as a tuple and unpacked at the call site.
 * The group is replaced by the call, e.g. `group_1(area, &mut total);` or `let area = compute_area(width, height);`, and the new function appears in the function list with its own graph.
-* The dialog lets you rename the function and parameters, choose value / `&` / `&mut`, and fill in types. Types are guessed from literals, annotations, the function's signature and simple operations. Press **Check** afterwards to let the compiler confirm.
+* The dialog lets you rename the function and parameters, choose value / `&` / `&mut`, and fill in types. Types are guessed from literals, annotations, the function's signature and simple operations.
+* **Ask the compiler for types** gets the real types from `rustc` (it runs on its own when the dialog opens and some types couldn't be guessed). rust-nodes writes a scratch copy of your project with a probe line like `let __rn_probe_0: () = parts;` just before the group (for parameters) and just after it (for return values), then runs `cargo check` on the copy. The compiler rejects each probe with *expected `()`, found `Vec<&str>`*, and that type is filled in. Your files aren't touched: the copy lives in a temp folder, and its build output goes to `target/rust-nodes-probe/` so dependencies don't rebuild. Files outside a cargo project are checked with plain `rustc`. Values that can't be written as a type (closures) are reported instead.
 * Groups whose meaning would change inside another function are refused with a reason: `return`, `?`, a `break`/`continue` for a loop outside the group, or execution entering or leaving the group in more than one place.
 
 Collapsing a loop or `if` automatically brings along its body and the value nodes that only feed it.
 
 ![Extract function dialog](docs/extract-dialog.png)
+![The compiler filled in Vec<&str>](docs/extract-compiler.png)
 ![The extracted function](docs/extracted.png)
 
 ## Using the editor
@@ -151,7 +153,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 | `src/codegen.rs` | graph → Rust (precedence-aware, formatted with `prettyplease`) |
 | `src/layout.rs` | node geometry and automatic layout |
 | `src/project.rs` | open/save, layout sidecar, finding the cargo project |
-| `src/extract.rs` | turning a group into a function: parameters, returns, `&mut`, safety checks |
+| `src/extract.rs` | turning a group into a function: parameters, returns, `&mut`, safety checks, type probes |
+| `src/compiler.rs` | running `cargo check` / `rustc` on a scratch copy and reading types from its errors |
 | `src/editor.rs` | the node canvas and inspector (`egui`) |
 | `src/app.rs` | the app window, panels, running cargo |
 | `src/tests.rs` | round-trip tests (`cargo test`) |
@@ -162,6 +165,7 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 * A value node wired into several places is written out at each use. Use a `let` to compute something once.
 * Inside templates, names bound by patterns and used in guard expressions (e.g. `*w > 0.0`) are matched by name, not by wire. The same goes for calling a closure stored in a variable (`add(1, 2)`).
 * Editing a template's code by hand works, but keep the `⟦n⟧` hole markers.
+* Asking the compiler copies the crate folder, so a crate that uses `path = "../other"` dependencies or workspace-inherited settings may fail to check from the scratch copy. Type the types by hand in that case.
 * Compile errors appear in the output panel but aren't highlighted on the nodes yet.
 * No undo yet.
 
@@ -173,7 +177,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 - [ ] Dedicated `match` / `if let` nodes with one exec pin per arm (on top of the generic templates)
 - [x] Collapse a selection into a group / ungroup
 - [x] Turn a group into a real Rust helper function ("extract function")
-- [ ] Ask the compiler for unknown types when extracting (the `let _: () = value;` trick)
+- [x] Ask the compiler for unknown types when extracting (the `let _: () = value;` trick)
+- [ ] Use the same compiler probe to show each wire's type on hover
 - [ ] Undo/redo, copy/paste, comment boxes, reroute nodes
 - [ ] Keep comments by storing them on nodes
 - [ ] Other backends (C, direct LLVM via `inkwell`) using the same graph
