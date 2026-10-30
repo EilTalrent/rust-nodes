@@ -99,6 +99,21 @@ Select some nodes and press **Ctrl+G** (or **▣ Collapse into a group** in the 
 ![A collapsed group](docs/group.png)
 ![Inside the group](docs/group-inside.png)
 
+### Extract function
+
+A group can become a **real Rust function**: right-click it → **ƒ Extract function…**, or use the button in the inspector.
+
+* Values flowing **into** the group become **parameters**. A variable that the group changes (assigned to, `&mut`, or a mutating method call on a `let mut`) is passed as `&mut`, and uses inside become `*name`.
+* Values used **after** the group are **returned**. Several are returned as a tuple and unpacked at the call site.
+* The group is replaced by the call, e.g. `group_1(area, &mut total);` or `let area = compute_area(width, height);`, and the new function appears in the function list with its own graph.
+* The dialog lets you rename the function and parameters, choose value / `&` / `&mut`, and fill in types. Types are guessed from literals, annotations, the function's signature and simple operations. Press **Check** afterwards to let the compiler confirm.
+* Groups whose meaning would change inside another function are refused with a reason: `return`, `?`, a `break`/`continue` for a loop outside the group, or execution entering or leaving the group in more than one place.
+
+Collapsing a loop or `if` automatically brings along its body and the value nodes that only feed it.
+
+![Extract function dialog](docs/extract-dialog.png)
+![The extracted function](docs/extracted.png)
+
 ## Using the editor
 
 * **Right-click** the canvas → add a node (with search)
@@ -136,6 +151,7 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 | `src/codegen.rs` | graph → Rust (precedence-aware, formatted with `prettyplease`) |
 | `src/layout.rs` | node geometry and automatic layout |
 | `src/project.rs` | open/save, layout sidecar, finding the cargo project |
+| `src/extract.rs` | turning a group into a function: parameters, returns, `&mut`, safety checks |
 | `src/editor.rs` | the node canvas and inspector (`egui`) |
 | `src/app.rs` | the app window, panels, running cargo |
 | `src/tests.rs` | round-trip tests (`cargo test`) |
@@ -156,7 +172,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 - [ ] Auto-generate nodes for every function in a crate (via rustdoc JSON) so you can search the whole ecosystem
 - [ ] Dedicated `match` / `if let` nodes with one exec pin per arm (on top of the generic templates)
 - [x] Collapse a selection into a group / ungroup
-- [ ] Turn a group into a real Rust helper function ("extract function")
+- [x] Turn a group into a real Rust helper function ("extract function")
+- [ ] Ask the compiler for unknown types when extracting (the `let _: () = value;` trick)
 - [ ] Undo/redo, copy/paste, comment boxes, reroute nodes
 - [ ] Keep comments by storing them on nodes
 - [ ] Other backends (C, direct LLVM via `inkwell`) using the same graph

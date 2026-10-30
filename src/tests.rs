@@ -203,3 +203,104 @@ fn groups_survive_editing_the_file_outside() {
     assert!(generate(&p2).code.contains("println!(\"done\")"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------- extract function ----------------
+
+/// Compile and run a Rust source file with rustc, returning stdout.
+fn run_rust(src: &str, tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("rn-extract-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.rs");
+    std::fs::write(&file, src).unwrap();
+    let exe = dir.join("prog");
+    let out = std::process::Command::new("rustc").arg("--edition=2021").arg("-o").arg(&exe).arg(&file).output().expect("rustc");
+    assert!(out.status.success(), "rustc failed:\n{}\n---\n{src}", String::from_utf8_lossy(&out.stderr));
+    let run = std::process::Command::new(&exe).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8(run.stdout).unwrap()
+}
+
+/// Group statements `range` of main's top-level chain (with the value nodes feeding them) and extract.
+fn extract_stmts(src: &str, range: std::ops::Range<usize>, name: &str) -> Result<(String, crate::extract::Plan), String> {
+    let mut p = parse_program(src).unwrap();
+    let path = p.functions().into_iter().find(|(_, f)| f.name == "main").unwrap().0;
+    let f = p.function_mut(&path).unwrap();
+    let chain = top_chain(f);
+    let mut ids: Vec<NodeId> = chain[range.clone()].to_vec();
+    // pull in value nodes that only feed the chosen statements (like box-selecting them)
+    let mut stack = ids.clone();
+    while let Some(id) = stack.pop() {
+        for pin in 0..f.nodes[&id].kind.data_ins().len() {
+            if let Some((s, _)) = f.data_source(id, pin) {
+                if f.nodes[&s].scope.is_none() && !f.nodes[&s].kind.is_exec() && !ids.contains(&s) {
+                    ids.push(s);
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    let g = f.collapse(&ids, name).unwrap();
+    let mut plan = crate::extract::plan(f, g)?;
+    plan.name = name.to_string();
+    crate::extract::apply(&mut p, &path, &plan)?;
+    let out = generate(&p);
+    assert!(out.error.is_none(), "{:?}", out.error);
+    Ok((out.code, plan))
+}
+
+const AREA: &str = r#"fn main() {
+    let width = 4;
+    let height = 5;
+    let area = width * height;
+    println!("area = {}", area);
+    let mut total = 0;
+    for i in 1..=area {
+        total += i;
+    }
+    println!("total = {}", total);
+}
+"#;
+
+#[test]
+fn extract_returns_two_values() {
+    let (code, plan) = extract_stmts(AREA, 0..2, "dimensions").unwrap();
+    assert_eq!(plan.signature(), "fn dimensions() -> (i32, i32)");
+    assert!(code.contains("let dimensions_out = dimensions();"), "{code}");
+    assert!(code.contains("let width = dimensions_out.0;"), "{code}");
+    assert!(code.contains("fn dimensions() -> (i32, i32) {"), "{code}");
+    assert_eq!(run_rust(&code, "two"), run_rust(AREA, "two-orig"));
+}
+
+#[test]
+fn extract_with_params_and_one_return() {
+    // `let area = width * height;` uses two outside values and produces one
+    let (code, plan) = extract_stmts(AREA, 2..3, "compute_area").unwrap();
+    assert_eq!(plan.signature(), "fn compute_area(width: i32, height: i32) -> i32");
+    assert!(code.contains("let area = compute_area(width, height);"), "{code}");
+    assert_eq!(run_rust(&code, "one"), run_rust(AREA, "one-orig"));
+}
+
+#[test]
+fn extract_mutation_becomes_mut_reference() {
+    // the for loop changes `total`, which lives outside the group
+    let (code, plan) = extract_stmts(AREA, 5..6, "sum_up").unwrap();
+    assert_eq!(plan.signature(), "fn sum_up(area: i32, total: &mut i32)");
+    assert!(code.contains("sum_up(area, &mut total);"), "{code}");
+    assert!(code.contains("*total += i;"), "{code}");
+    assert_eq!(run_rust(&code, "mut"), run_rust(AREA, "mut-orig"));
+}
+
+#[test]
+fn extract_refuses_return() {
+    let src = "fn main() {\n    let x = 3;\n    if x > 2 {\n        return;\n    }\n    println!(\"{}\", x);\n}\n";
+    let err = extract_stmts(src, 1..2, "check").unwrap_err();
+    assert!(err.contains("return"), "{err}");
+}
+
+#[test]
+fn extract_refuses_break_of_outside_loop() {
+    let src = "fn main() {\n    let mut i = 0;\n    loop {\n        i += 1;\n        if i > 3 {\n            break;\n        }\n    }\n    println!(\"{}\", i);\n}\n";
+    // group only the `if` inside the loop body is not reachable via top_chain; group the loop: allowed
+    let (code, _) = extract_stmts(src, 1..2, "count_up").unwrap();
+    assert_eq!(run_rust(&code, "loop"), run_rust(src, "loop-orig"));
+}

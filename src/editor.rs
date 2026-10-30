@@ -58,6 +58,8 @@ pub struct Editor {
     pub needs_fit: bool,
     /// Containers / groups we've opened, outermost first. Empty = function top level.
     pub view: Vec<(NodeId, usize)>,
+    /// Set when the user asks to turn a group into a function; the app shows the dialog.
+    pub extract_request: Option<NodeId>,
 }
 
 impl Default for Editor {
@@ -72,6 +74,7 @@ impl Default for Editor {
             box_start: None,
             needs_fit: true,
             view: vec![],
+            extract_request: None,
         }
     }
 }
@@ -361,6 +364,10 @@ impl Editor {
                 if is_group {
                     if ui.button("Open group").clicked() {
                         enter = Some((id, 0));
+                        ui.close();
+                    }
+                    if ui.button("ƒ Extract function…").on_hover_text("Turn this group into a real Rust function").clicked() {
+                        self.extract_request = Some(id);
                         ui.close();
                     }
                     if ui.button("Ungroup").clicked() {
@@ -889,7 +896,10 @@ impl Editor {
                         ungroup = true;
                     }
                 });
-                ui.weak("A group only tidies up the graph: the generated Rust is the same with or without it.");
+                if ui.button("ƒ Extract function…").on_hover_text("Turn this group into a real Rust function").clicked() {
+                    self.extract_request = Some(id);
+                }
+                ui.weak("A group only tidies up the graph: the generated Rust is the same with or without it. Extract function turns it into a real helper function.");
             }
             Entry => {
                 ui.weak("Function start. Edit the signature in the left panel.");

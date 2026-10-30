@@ -1,6 +1,7 @@
 mod app;
 mod codegen;
 mod editor;
+mod extract;
 mod graph;
 mod layout;
 mod parse;

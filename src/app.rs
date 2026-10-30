@@ -5,6 +5,7 @@ use crate::codegen::{generate, Generated};
 use crate::editor::Editor;
 use crate::graph::*;
 use crate::parse::parse_signature;
+use crate::extract;
 use crate::project;
 use eframe::egui;
 use std::collections::HashMap;
@@ -43,6 +44,8 @@ struct App {
     running: Arc<AtomicBool>,
     /// false until a .rs file has been opened or created: the window starts blank
     has_file: bool,
+    /// "Extract function" dialog
+    extract: Option<ExtractDialog>,
     /// the "add a Rust source file?" prompt
     show_prompt: bool,
     prompt_error: Option<String>,
@@ -66,6 +69,7 @@ impl App {
             output: Arc::new(Mutex::new(String::new())),
             running: Arc::new(AtomicBool::new(false)),
             has_file: false,
+            extract: None,
             show_prompt: true,
             prompt_error: None,
         };
@@ -314,9 +318,110 @@ impl App {
         self.mark_changed();
     }
 
+    fn take_extract_request(&mut self, path: &[usize]) {
+        let Some(g) = self.editors.get_mut(path).and_then(|e| e.extract_request.take()) else { return };
+        let Some(f) = self.program.function_mut(path) else { return };
+        self.extract = Some(ExtractDialog { fn_path: path.to_vec(), plan: extract::plan(f, g) });
+    }
+
     fn mark_changed(&mut self) {
         self.unsaved = true;
         self.code = generate(&self.program);
+    }
+}
+
+struct ExtractDialog {
+    fn_path: Vec<usize>,
+    plan: Result<extract::Plan, String>,
+}
+
+impl App {
+    fn extract_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dlg) = &mut self.extract else { return };
+        let existing = extract::function_names(&self.program);
+        let mut close = false;
+        let mut run = false;
+        egui::Modal::new(egui::Id::unique("extract-fn")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.heading("ƒ Extract function");
+            ui.add_space(4.0);
+            match &mut dlg.plan {
+                Err(e) => {
+                    ui.label("This group can't be turned into a function:");
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 100), e.as_str());
+                    ui.add_space(8.0);
+                    if ui.button("OK").clicked() {
+                        close = true;
+                    }
+                }
+                Ok(plan) => {
+                    ui.weak("Values flowing into the group become parameters; values used after it are returned.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut plan.name).code_editor().desired_width(240.0));
+                    });
+                    ui.add_space(6.0);
+                    ui.strong(if plan.params.is_empty() { "No parameters" } else { "Parameters" });
+                    if !plan.params.is_empty() {
+                        egui::Grid::new("params").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                            for (i, p) in plan.params.iter_mut().enumerate() {
+                                ui.add_sized([130.0, 20.0], egui::TextEdit::singleline(&mut p.name).code_editor());
+                                egui::ComboBox::from_id_salt(("mode", i)).selected_text(p.mode.label()).width(70.0).show_ui(ui, |ui| {
+                                    for m in [extract::Mode::Value, extract::Mode::Ref, extract::Mode::Mut] {
+                                        ui.selectable_value(&mut p.mode, m, m.label());
+                                    }
+                                });
+                                ui.add(egui::TextEdit::singleline(&mut p.ty).code_editor().desired_width(220.0).hint_text("type, e.g. i32"));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    ui.add_space(6.0);
+                    ui.strong(if plan.outputs.is_empty() { "Returns nothing" } else { "Returns" });
+                    if !plan.outputs.is_empty() {
+                        egui::Grid::new("outs").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                            for o in plan.outputs.iter_mut() {
+                                ui.add_sized([130.0, 20.0], egui::TextEdit::singleline(&mut o.name).code_editor());
+                                ui.add(egui::TextEdit::singleline(&mut o.ty).code_editor().desired_width(300.0).hint_text("type, e.g. String"));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(plan.signature()).monospace().strong());
+                    let problems = plan.problems(&existing);
+                    for p in &problems {
+                        ui.colored_label(egui::Color32::from_rgb(230, 160, 90), format!("• {p}"));
+                    }
+                    ui.weak("Types are guessed where possible. Press Check afterwards to let the compiler confirm.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(problems.is_empty(), egui::Button::new("Extract")).clicked() {
+                            run = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            }
+        });
+        if run {
+            let dlg = self.extract.take().unwrap();
+            if let Ok(plan) = dlg.plan {
+                match extract::apply(&mut self.program, &dlg.fn_path, &plan) {
+                    Ok(_) => {
+                        self.status = format!("Extracted `{}`", plan.name);
+                        self.editors.clear();
+                        self.mark_changed();
+                    }
+                    Err(e) => self.status = format!("Extract failed: {e}"),
+                }
+            }
+        } else if close {
+            self.extract = None;
+        }
     }
 }
 
@@ -381,6 +486,8 @@ impl eframe::App for App {
         if self.show_prompt {
             self.prompt(&ctx);
         }
+
+        self.extract_dialog(&ctx);
 
         if !self.has_file {
             // Blank application: nothing open yet.
@@ -460,6 +567,7 @@ impl eframe::App for App {
             if changed {
                 self.mark_changed();
             }
+            self.take_extract_request(&path);
             ui.separator();
             ui.horizontal(|ui| {
                 ui.heading("Generated Rust");
@@ -488,6 +596,7 @@ impl eframe::App for App {
             if changed {
                 self.mark_changed();
             }
+            self.take_extract_request(&path);
         });
     }
 }

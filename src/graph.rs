@@ -502,6 +502,7 @@ impl FnGraph {
         if ids.iter().any(|id| self.nodes[id].scope != scope) {
             return None;
         }
+        let ids = self.complete_selection(&ids);
         let x = ids.iter().map(|id| self.nodes[id].pos[0]).fold(f32::MAX, f32::min);
         let y = ids.iter().map(|id| self.nodes[id].pos[1]).fold(f32::MAX, f32::min);
         let g = self.add_in(NodeKind::Group { name: name.to_string() }, [x, y], scope);
@@ -509,6 +510,54 @@ impl FnGraph {
             self.nodes.get_mut(&id).unwrap().scope = Some((g, 0));
         }
         Some(g)
+    }
+
+    /// Grow a selection so it makes sense as a unit: the bodies of selected loops / ifs
+    /// come along, and so do value nodes that only feed the selection.
+    pub fn complete_selection(&self, ids: &[NodeId]) -> Vec<NodeId> {
+        let Some(&first) = ids.first() else { return vec![] };
+        let scope = self.nodes[&first].scope;
+        let mut set: std::collections::BTreeSet<NodeId> = ids.iter().copied().collect();
+        // bodies / branches (every exec pin except "next")
+        let mut stack: Vec<NodeId> = vec![];
+        for id in ids {
+            let k = &self.nodes[id].kind;
+            for pin in 0..k.exec_outs().len() {
+                if Some(pin) != k.next_pin() {
+                    if let Some(t) = self.exec_target(*id, pin) {
+                        stack.push(t);
+                    }
+                }
+            }
+        }
+        while let Some(n) = stack.pop() {
+            if self.nodes.get(&n).is_none_or(|x| x.scope != scope) || !set.insert(n) {
+                continue;
+            }
+            for pin in 0..self.nodes[&n].kind.exec_outs().len() {
+                if let Some(t) = self.exec_target(n, pin) {
+                    stack.push(t);
+                }
+            }
+        }
+        // value nodes whose every use is inside the selection
+        loop {
+            let add: Vec<NodeId> = self
+                .nodes
+                .iter()
+                .filter(|(id, n)| n.scope == scope && !n.kind.is_exec() && !set.contains(id) && !self.is_group(**id))
+                .filter(|(id, _)| {
+                    let mut users = self.data.iter().filter(|e| e.from == **id).peekable();
+                    users.peek().is_some() && users.all(|e| set.contains(&e.to))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if add.is_empty() {
+                break;
+            }
+            set.extend(add);
+        }
+        set.into_iter().collect()
     }
 
     /// Dissolve a group: its members go back to the group's own view.
