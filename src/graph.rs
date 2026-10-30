@@ -47,6 +47,40 @@ pub struct FnGraph {
 pub struct Node {
     pub kind: NodeKind,
     pub pos: [f32; 2],
+    /// Which container this node lives in: `None` = the function's top level,
+    /// `Some((template_node, hole))` = inside that template's block hole.
+    #[serde(default)]
+    pub scope: Scope,
+}
+
+pub type Scope = Option<(NodeId, usize)>;
+
+/// A hole in a template node. Marked in the template code as `⟦n⟧`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Hole {
+    /// `false`: an expression, fed by a data wire.
+    /// `true`: a block of statements, i.e. a container with its own sub-graph.
+    pub block: bool,
+    /// Variables the construct creates for this block (e.g. `v` in `Some(v) => ...`, `x` in `|x| ...`).
+    pub binders: Vec<String>,
+    /// A block in expression position (match arm, closure body) may be written without braces.
+    pub bare_ok: bool,
+    /// Lowest operator precedence that fits here without parentheses.
+    pub prec: u8,
+}
+
+/// Marker for hole `i` inside template code.
+pub fn hole_marker(i: usize) -> String {
+    format!("⟦{i}⟧")
+}
+
+/// Circled number for display, e.g. ⓪ ① ②.
+pub fn hole_label(i: usize) -> String {
+    match i {
+        0 => "⓪".into(),
+        1..=20 => char::from_u32(0x2460 + i as u32 - 1).map(String::from).unwrap_or_else(|| format!("[{i}]")),
+        _ => format!("[{i}]"),
+    }
 }
 
 /// Exec wire: from an exec output pin to a node's (single) exec input.
@@ -88,6 +122,13 @@ pub enum NodeKind {
     Return,
     /// Escape hatch: any statement as raw Rust.
     RawStmt { code: String },
+    /// A statement we have no dedicated node for (match, if let, labelled loop, ...),
+    /// shown as Rust code with holes. Expression holes are data inputs; block holes are containers.
+    TemplateStmt { code: String, holes: Vec<Hole> },
+    /// Start of a container (block hole). Outputs = variables the construct binds.
+    BlockEntry { binders: Vec<String> },
+    /// The value a container block produces (its tail expression).
+    BlockValue,
 
     // ---- pure nodes: only data pins ----
     Literal { code: String },
@@ -108,6 +149,8 @@ pub enum NodeKind {
     Index,
     /// Escape hatch: any expression as raw Rust.
     RawExpr { code: String },
+    /// Expression version of [`NodeKind::TemplateStmt`] (closures, match used as a value, ...).
+    Template { code: String, holes: Vec<Hole> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,6 +162,7 @@ pub enum Category {
     Op,
     Call,
     Raw,
+    Template,
 }
 
 impl NodeKind {
@@ -126,22 +170,53 @@ impl NodeKind {
         use NodeKind::*;
         matches!(
             self,
-            Entry | Let { .. } | Assign { .. } | Eval | If | While | Loop | For { .. } | Break | Continue | Return | RawStmt { .. }
+            Entry
+                | Let { .. }
+                | Assign { .. }
+                | Eval
+                | If
+                | While
+                | Loop
+                | For { .. }
+                | Break
+                | Continue
+                | Return
+                | RawStmt { .. }
+                | TemplateStmt { .. }
+                | BlockEntry { .. }
+                | BlockValue
         )
     }
 
     pub fn has_exec_in(&self) -> bool {
-        self.is_exec() && !matches!(self, NodeKind::Entry)
+        self.is_exec() && !matches!(self, NodeKind::Entry | NodeKind::BlockEntry { .. })
+    }
+
+    pub fn holes(&self) -> &[Hole] {
+        match self {
+            NodeKind::Template { holes, .. } | NodeKind::TemplateStmt { holes, .. } => holes,
+            _ => &[],
+        }
+    }
+
+    /// Indices of holes that are containers.
+    pub fn block_holes(&self) -> Vec<usize> {
+        self.holes().iter().enumerate().filter(|(_, h)| h.block).map(|(i, _)| i).collect()
+    }
+
+    /// Indices of holes that are expression inputs, in pin order.
+    pub fn expr_holes(&self) -> Vec<usize> {
+        self.holes().iter().enumerate().filter(|(_, h)| !h.block).map(|(i, _)| i).collect()
     }
 
     /// Names of the exec output pins. The pin called "next" (or the only pin) continues the chain.
     pub fn exec_outs(&self) -> &'static [&'static str] {
         use NodeKind::*;
         match self {
-            Entry | Let { .. } | Assign { .. } | Eval | RawStmt { .. } => &[""],
+            Entry | Let { .. } | Assign { .. } | Eval | RawStmt { .. } | TemplateStmt { .. } | BlockEntry { .. } => &[""],
             If => &["then", "else", "next"],
             While | Loop | For { .. } => &["body", "next"],
-            Break | Continue | Return => &[],
+            Break | Continue | Return | BlockValue => &[],
             _ => &[],
         }
     }
@@ -160,7 +235,8 @@ impl NodeKind {
         use NodeKind::*;
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
         match self {
-            Let { .. } | Eval | Return => s(&["value"]),
+            Let { .. } | Eval | Return | BlockValue => s(&["value"]),
+            Template { .. } | TemplateStmt { .. } => self.expr_holes().into_iter().map(hole_label).collect(),
             Assign { .. } => s(&["target", "value"]),
             If | While => s(&["cond"]),
             For { .. } => s(&["iter"]),
@@ -182,6 +258,8 @@ impl NodeKind {
         use NodeKind::*;
         match self {
             Entry => params.to_vec(),
+            BlockEntry { binders } => binders.clone(),
+            Template { .. } => vec![String::new()],
             Let { name, .. } => vec![name.clone()],
             For { var } => vec![var.clone()],
             Literal { .. } | Var { .. } | Binary { .. } | Unary { .. } | Call { .. } | Method { .. } | Macro { .. }
@@ -218,13 +296,20 @@ impl NodeKind {
             Field { name } => format!(".{name}"),
             Index => "[ ]".into(),
             RawExpr { .. } => "Rust expr".into(),
+            Template { .. } => "Rust".into(),
+            TemplateStmt { .. } => "Rust".into(),
+            BlockEntry { binders } if binders.is_empty() => "Block start".into(),
+            BlockEntry { binders } => format!("Block start ({})", binders.join(", ")),
+            BlockValue => "Result".into(),
         }
     }
 
     pub fn category(&self) -> Category {
         use NodeKind::*;
         match self {
-            Entry => Category::Entry,
+            Entry | BlockEntry { .. } => Category::Entry,
+            BlockValue => Category::Flow,
+            Template { .. } | TemplateStmt { .. } => Category::Template,
             If | While | Loop | For { .. } | Break | Continue | Return => Category::Flow,
             Let { .. } | Assign { .. } | Eval => Category::Statement,
             Literal { .. } | Var { .. } => Category::Value,
@@ -234,10 +319,17 @@ impl NodeKind {
         }
     }
 
-    /// Raw code shown inside the node body (for escape-hatch nodes).
-    pub fn body_text(&self) -> Option<&str> {
+    /// Code shown inside the node body (raw nodes, and templates with ⓪ ① for holes).
+    pub fn body_text(&self) -> Option<String> {
         match self {
-            NodeKind::RawStmt { code } | NodeKind::RawExpr { code } => Some(code),
+            NodeKind::RawStmt { code } | NodeKind::RawExpr { code } => Some(code.clone()),
+            NodeKind::Template { code, holes } | NodeKind::TemplateStmt { code, holes } => {
+                let mut c = code.clone();
+                for i in 0..holes.len() {
+                    c = c.replace(&hole_marker(i), &hole_label(i));
+                }
+                Some(c)
+            }
             _ => None,
         }
     }
@@ -258,6 +350,7 @@ impl NodeKind {
             ("Break", Break),
             ("Continue", Continue),
             ("Return", Return),
+            ("Result (value of a block)", BlockValue),
             ("Literal", Literal { code: "0".into() }),
             ("String literal", Literal { code: "\"text\"".into() }),
             ("Variable / path", Var { name: "x".into() }),
@@ -310,19 +403,38 @@ impl FnGraph {
     }
 
     pub fn add(&mut self, kind: NodeKind, pos: [f32; 2]) -> NodeId {
+        self.add_in(kind, pos, None)
+    }
+
+    pub fn add_in(&mut self, kind: NodeKind, pos: [f32; 2], scope: Scope) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Node { kind, pos });
+        self.nodes.insert(id, Node { kind, pos, scope });
         id
     }
 
+    /// The Block start node of a container, if it exists.
+    pub fn block_entry(&self, container: NodeId, hole: usize) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .find(|(_, n)| n.scope == Some((container, hole)) && matches!(n.kind, NodeKind::BlockEntry { .. }))
+            .map(|(id, _)| *id)
+    }
+
+    /// Delete a node, and everything inside it if it's a container.
     pub fn remove(&mut self, id: NodeId) {
-        if id == self.entry {
+        if id == self.entry || matches!(self.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::BlockEntry { .. })) {
             return;
         }
-        self.nodes.remove(&id);
-        self.exec.retain(|e| e.from != id && e.to != id);
-        self.data.retain(|e| e.from != id && e.to != id);
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            let inner: Vec<NodeId> =
+                self.nodes.iter().filter(|(_, x)| x.scope.map(|s| s.0) == Some(n)).map(|(i, _)| *i).collect();
+            stack.extend(inner);
+            self.nodes.remove(&n);
+            self.exec.retain(|e| e.from != n && e.to != n);
+            self.data.retain(|e| e.from != n && e.to != n);
+        }
     }
 
     /// Connect an exec output. An exec output has at most one wire, so any old wire is replaced.

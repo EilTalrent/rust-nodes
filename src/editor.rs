@@ -50,11 +50,13 @@ pub struct Editor {
     dragging_wire: Option<Pin>,
     add_menu: Option<AddMenu>,
     pub needs_fit: bool,
+    /// Containers we've opened, outermost first. Empty = function top level.
+    pub view: Vec<(NodeId, usize)>,
 }
 
 impl Default for Editor {
     fn default() -> Self {
-        Editor { pan: Vec2::new(40.0, 60.0), zoom: 1.0, selected: None, dragging_wire: None, add_menu: None, needs_fit: true }
+        Editor { pan: Vec2::new(40.0, 60.0), zoom: 1.0, selected: None, dragging_wire: None, add_menu: None, needs_fit: true, view: vec![] }
     }
 }
 
@@ -70,6 +72,7 @@ fn header_color(c: Category) -> Color32 {
         Category::Op => Color32::from_rgb(40, 130, 90),
         Category::Call => Color32::from_rgb(120, 60, 150),
         Category::Raw => Color32::from_rgb(70, 70, 70),
+        Category::Template => Color32::from_rgb(30, 110, 120),
     }
 }
 
@@ -77,12 +80,40 @@ impl Editor {
     /// Draw the canvas for one function. Returns true if the graph changed.
     pub fn show(&mut self, ui: &mut egui::Ui, f: &mut FnGraph, salt: &str) -> bool {
         let mut changed = false;
+        // ---- breadcrumb: where we are inside nested containers ----
+        self.view.retain(|(n, _)| f.nodes.contains_key(n));
+        if !self.view.is_empty() {
+            let mut go_to: Option<usize> = None;
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                if ui.button(format!("⬅ {}", f.name)).on_hover_text("Back to the function (Esc goes up one level)").clicked() {
+                    go_to = Some(0);
+                }
+                for (depth, (n, hole)) in self.view.iter().enumerate() {
+                    ui.label("›");
+                    let label = format!("{} {}", container_label(&f.nodes[n].kind), hole_label(*hole));
+                    let last = depth + 1 == self.view.len();
+                    if ui.add_enabled(!last, egui::Button::new(label)).clicked() {
+                        go_to = Some(depth + 1);
+                    }
+                }
+            });
+            if let Some(d) = go_to {
+                self.view.truncate(d);
+                self.selected = None;
+                self.needs_fit = true;
+            }
+        }
+        let scope: Scope = self.view.last().copied();
+        let in_view = |f: &FnGraph, id: NodeId| f.nodes.get(&id).is_some_and(|n| n.scope == scope);
+        let mut enter: Option<(NodeId, usize)> = None;
+
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         let base_id = ui.scope_id().with(("rust-nodes-canvas", salt));
 
         if self.needs_fit {
-            self.fit(f, rect);
+            self.fit(f, rect, scope);
             self.needs_fit = false;
         }
 
@@ -134,6 +165,9 @@ impl Editor {
 
         // ---- wires ----
         for e in &f.data {
+            if !in_view(f, e.from) || !in_view(f, e.to) {
+                continue;
+            }
             if let (Some(a), Some(b)) = (f.nodes.get(&e.from), f.nodes.get(&e.to)) {
                 let p0 = self.to_screen(rect, data_out_pos(a, e.from_pin, &f.params));
                 let p1 = self.to_screen(rect, data_in_pos(b, e.to_pin));
@@ -141,6 +175,9 @@ impl Editor {
             }
         }
         for e in &f.exec {
+            if !in_view(f, e.from) || !in_view(f, e.to) {
+                continue;
+            }
             if let (Some(a), Some(b)) = (f.nodes.get(&e.from), f.nodes.get(&e.to)) {
                 let p0 = self.to_screen(rect, exec_out_pos(a, e.from_pin, &f.params));
                 let p1 = self.to_screen(rect, exec_in_pos(b));
@@ -150,10 +187,11 @@ impl Editor {
 
         // ---- nodes ----
         let z = self.zoom;
-        let ids: Vec<NodeId> = f.nodes.keys().copied().collect();
+        let ids: Vec<NodeId> = f.nodes.iter().filter(|(_, n)| n.scope == scope).map(|(id, _)| *id).collect();
         let mut to_delete = None;
         let mut to_duplicate = None;
         let mut pins: Vec<(Pin, Pos2)> = vec![];
+        let mut pills: Vec<(Pos2, String)> = vec![];
         for id in ids {
             let node = &f.nodes[&id];
             let [w, h] = node_size(&node.kind, &f.params);
@@ -172,12 +210,18 @@ impl Editor {
             if nresp.clicked() || nresp.drag_started() {
                 self.selected = Some(id);
             }
+            if nresp.double_clicked() {
+                if let Some(&hole) = f.nodes[&id].kind.block_holes().first() {
+                    enter = Some((id, hole));
+                }
+            }
+            let fixed = id == f.entry || matches!(f.nodes[&id].kind, NodeKind::BlockEntry { .. });
             nresp.context_menu(|ui| {
-                if id != f.entry && ui.button("Delete").clicked() {
+                if !fixed && ui.button("Delete").clicked() {
                     to_delete = Some(id);
                     ui.close();
                 }
-                if id != f.entry && ui.button("Duplicate").clicked() {
+                if !fixed && ui.button("Duplicate").clicked() {
                     to_duplicate = Some(id);
                     ui.close();
                 }
@@ -215,9 +259,15 @@ impl Editor {
             }
             for (i, name) in kind.data_ins().iter().enumerate() {
                 let p = self.to_screen(rect, data_in_pos(node, i));
-                let connected = f.data_source(id, i).is_some();
-                self.data_pin(&painter, p, connected);
+                let source = f.data_source(id, i);
+                self.data_pin(&painter, p, source.is_some());
                 painter.text(p + Vec2::new(10.0 * z, 0.0), Align2::LEFT_CENTER, name, label_font.clone(), label_color);
+                // a value coming from outside this container: label it with where it comes from
+                if let Some((src, sp)) = source {
+                    if !in_view(f, src) {
+                        pills.push((p, crate::codegen::expr_preview(f, src, sp)));
+                    }
+                }
                 pins.push((Pin::DataIn(id, i), p));
             }
             // right pins
@@ -234,11 +284,12 @@ impl Editor {
                 painter.text(p - Vec2::new(10.0 * z, 0.0), Align2::RIGHT_CENTER, name, label_font.clone(), label_color);
                 pins.push((Pin::DataOut(id, i), p));
             }
-            // raw code body
+            // code body (raw nodes and templates)
             if let Some(code) = kind.body_text() {
-                let rows = left_rows(kind).max(right_rows(kind, &f.params)).max(1);
-                let mut y = r.top() + (HEADER + rows as f32 * ROW + 4.0) * z;
-                for line in code.lines().take(12) {
+                let mut y = r.top() + (body_top(kind, &f.params) + 2.0) * z;
+                let lines: Vec<&str> = code.lines().collect();
+                for (li, line) in lines.iter().take(MAX_BODY_LINES).enumerate() {
+                    let line = if li + 1 == MAX_BODY_LINES && lines.len() > MAX_BODY_LINES { "…" } else { line };
                     painter.text(
                         Pos2::new(r.left() + 8.0 * z, y),
                         Align2::LEFT_TOP,
@@ -249,6 +300,36 @@ impl Editor {
                     y += LINE * z;
                 }
             }
+            // container rows: click to open
+            for (k, hole) in kind.block_holes().into_iter().enumerate() {
+                let top = r.top() + block_row_top(kind, &f.params, k) * z;
+                let row = Rect::from_min_size(Pos2::new(r.left() + 4.0 * z, top), Vec2::new(r.width() - 8.0 * z, (ROW - 3.0) * z));
+                let rr = ui.interact(row, base_id.with(("open", id, hole)), Sense::click());
+                let fill = if rr.hovered() { Color32::from_rgb(40, 95, 105) } else { Color32::from_rgb(34, 70, 78) };
+                painter.rect_filled(row, CornerRadius::same((4.0 * z) as u8), fill);
+                let binders = &kind.holes()[hole].binders;
+                let inner = f.nodes.values().filter(|n| n.scope == Some((id, hole))).count().saturating_sub(1);
+                let mut label = format!("▶ open {}", hole_label(hole));
+                if !binders.is_empty() {
+                    label += &format!("  ({})", binders.join(", "));
+                }
+                label += &format!("  · {inner} node{}", if inner == 1 { "" } else { "s" });
+                painter.text(row.left_center() + Vec2::new(6.0 * z, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(11.5 * z), Color32::WHITE);
+                if rr.clicked() {
+                    enter = Some((id, hole));
+                }
+            }
+        }
+
+        // labels for values that come from outside this container (drawn on top)
+        for (p, text) in pills {
+            let galley = painter.layout_no_wrap(format!("{text} ›"), FontId::monospace(11.0 * z), Color32::from_rgb(170, 240, 210));
+            let size = galley.size() + Vec2::new(10.0, 4.0) * z;
+            let pill = Rect::from_min_size(p - Vec2::new(size.x + 8.0 * z, size.y * 0.5), size);
+            painter.rect_filled(pill, CornerRadius::same((4.0 * z) as u8), Color32::from_rgb(28, 62, 52));
+            painter.rect_stroke(pill, CornerRadius::same((4.0 * z) as u8), Stroke::new(1.0, DATA_COLOR), StrokeKind::Inside);
+            painter.line_segment([pill.right_center(), p], Stroke::new(1.5, DATA_COLOR));
+            painter.galley(pill.min + Vec2::new(5.0, 2.0) * z, galley, Color32::WHITE);
         }
 
         // ---- pin interaction (after nodes, so pins win over node bodies) ----
@@ -301,6 +382,18 @@ impl Editor {
             }
         }
 
+        if let Some(e) = enter {
+            self.view.push(e);
+            self.selected = None;
+            self.add_menu = None;
+            self.needs_fit = true;
+        }
+        if !self.view.is_empty() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.add_menu.is_none() {
+            self.view.pop();
+            self.selected = None;
+            self.needs_fit = true;
+        }
+
         // ---- keyboard ----
         if !ui.ctx().egui_wants_keyboard_input() && resp.ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
             if let Some(sel) = self.selected {
@@ -343,6 +436,7 @@ impl Editor {
         let Some(menu) = &mut self.add_menu else { return false };
         let mut chosen: Option<NodeKind> = None;
         let mut close = false;
+        let first_frame = menu.just_opened;
         let area = egui::Area::new(ui.scope_id().with("rust-nodes-add-menu"))
             .fixed_pos(menu.screen_pos)
             .order(egui::Order::Foreground)
@@ -377,14 +471,15 @@ impl Editor {
                     }
                 });
             });
-        if area.response.clicked_elsewhere() && chosen.is_none() {
+        // (the click that opened the menu doesn't count as clicking elsewhere)
+        if !first_frame && area.response.clicked_elsewhere() && chosen.is_none() {
             close = true;
         }
         let mut changed = false;
         if let Some(kind) = chosen {
             let pending = menu.pending;
             let pos = menu.world_pos;
-            let id = f.add(kind, pos);
+            let id = f.add_in(kind, pos, self.view.last().copied());
             if let Some(p) = pending {
                 if let Some(to) = first_compatible_pin(f, id, p) {
                     connect(f, p, to);
@@ -437,10 +532,10 @@ impl Editor {
     }
 
     /// Zoom/pan so the whole graph is visible.
-    fn fit(&mut self, f: &FnGraph, rect: Rect) {
+    fn fit(&mut self, f: &FnGraph, rect: Rect, scope: Scope) {
         let mut min = [f32::MAX, f32::MAX];
         let mut max = [f32::MIN, f32::MIN];
-        for n in f.nodes.values() {
+        for n in f.nodes.values().filter(|n| n.scope == scope) {
             let [w, h] = node_size(&n.kind, &f.params);
             min = [min[0].min(n.pos[0]), min[1].min(n.pos[1])];
             max = [max[0].max(n.pos[0] + w), max[1].max(n.pos[1] + h)];
@@ -465,6 +560,7 @@ impl Editor {
         };
         ui.strong(node.kind.title());
         let mut c = false;
+        let mut open: Option<(NodeId, usize)> = None;
         let mono = |ui: &mut egui::Ui, label: &str, s: &mut String| -> bool {
             ui.horizontal(|ui| {
                 ui.label(label);
@@ -513,6 +609,35 @@ impl Editor {
                 c |= ui.checkbox(bracket, "use [ ] brackets").changed();
             }
             Field { name } => c |= mono(ui, "field", name),
+            Template { code, holes } | TemplateStmt { code, holes } => {
+                ui.label("Rust code with holes:");
+                c |= ui.add(egui::TextEdit::multiline(code).code_editor().desired_rows(6).desired_width(f32::INFINITY)).changed();
+                ui.weak("Keep the ⟦n⟧ markers: they are where the holes go.");
+                ui.add_space(4.0);
+                for (i, h) in holes.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if h.block {
+                            let b = if h.binders.is_empty() { String::new() } else { format!(" ({})", h.binders.join(", ")) };
+                            ui.label(format!("{} block{b}", hole_label(i)));
+                            if ui.small_button("Open").clicked() {
+                                open = Some((id, i));
+                            }
+                        } else {
+                            ui.label(format!("{} value input", hole_label(i)));
+                        }
+                    });
+                }
+            }
+            BlockEntry { binders } => {
+                if binders.is_empty() {
+                    ui.weak("Start of this block.");
+                } else {
+                    ui.weak(format!("Start of this block. Values the construct gives the block: {}", binders.join(", ")));
+                }
+            }
+            BlockValue => {
+                ui.weak("The value this block produces (e.g. the result of a match arm or closure).");
+            }
             RawExpr { code } | RawStmt { code } => {
                 ui.label("Rust code:");
                 c |= ui.add(egui::TextEdit::multiline(code).code_editor().desired_rows(6).desired_width(f32::INFINITY)).changed();
@@ -523,6 +648,11 @@ impl Editor {
         }
         if c {
             f.prune_edges();
+        }
+        if let Some(o) = open {
+            self.view.push(o);
+            self.selected = None;
+            self.needs_fit = true;
         }
         c
     }
@@ -563,4 +693,17 @@ fn first_compatible_pin(f: &FnGraph, id: NodeId, p: Pin) -> Option<Pin> {
         Pin::DataIn(..) if !k.data_outs(&f.params).is_empty() => Some(Pin::DataOut(id, 0)),
         _ => None,
     }
+}
+
+fn container_label(k: &NodeKind) -> String {
+    let code = match k {
+        NodeKind::Template { code, .. } | NodeKind::TemplateStmt { code, .. } => code.as_str(),
+        _ => return k.title(),
+    };
+    // first word of the construct: match, if, while, |closure|, unsafe ...
+    let t = code.trim_start();
+    if t.starts_with('|') || t.starts_with("move") {
+        return "closure".into();
+    }
+    t.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\'')).find(|w| !w.is_empty()).unwrap_or("block").to_string()
 }

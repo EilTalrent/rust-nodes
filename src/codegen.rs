@@ -46,7 +46,7 @@ fn gen_items(items: &[Item], out: &mut String) {
 }
 
 pub fn gen_fn(f: &FnGraph) -> String {
-    let mut g = Gen { f, out: String::new(), visited: HashSet::new() };
+    let mut g = Gen { f, out: String::new(), visited: HashSet::new(), container: false };
     let start = f.exec_target(f.entry, 0);
     g.chain(start, true);
     format!("{} {{\n{}}}", f.sig, g.out)
@@ -56,14 +56,24 @@ struct Gen<'a> {
     f: &'a FnGraph,
     out: String,
     visited: HashSet<NodeId>,
+    /// generating the inside of a container block (not the function body)
+    container: bool,
+}
+
+/// Short text for whatever feeds a data pin, used to label wires that come from
+/// outside the container being viewed.
+pub fn expr_preview(f: &FnGraph, id: NodeId, pin: usize) -> String {
+    let g = Gen { f, out: String::new(), visited: HashSet::new(), container: false };
+    let s = g.expr(id, pin, 0).0.replace('\n', " ");
+    if s.chars().count() > 24 { format!("{}…", s.chars().take(23).collect::<String>()) } else { s }
 }
 
 // Operator precedence, higher binds tighter.
-const P_LOWEST: u8 = 0;
-const P_UNARY: u8 = 20;
-const P_ATOM: u8 = 30;
+pub const P_LOWEST: u8 = 0;
+pub const P_UNARY: u8 = 20;
+pub const P_ATOM: u8 = 30;
 
-fn bin_prec(op: &str) -> u8 {
+pub fn bin_prec(op: &str) -> u8 {
     match op {
         "||" => 3,
         "&&" => 4,
@@ -146,14 +156,23 @@ impl<'a> Gen<'a> {
             }
             Break => self.line("break;"),
             Continue => self.line("continue;"),
-            Return => match (self.input_opt(id, 0), last_top) {
+            Return => match (self.input_opt(id, 0), last_top && !self.container) {
                 (Some(v), true) => self.line(&v), // tail expression
                 (None, true) => {}
                 (Some(v), false) => self.line(&format!("return {v};")),
                 (None, false) => self.line("return;"),
             },
+            BlockValue => match (self.input_opt(id, 0), last_top) {
+                (Some(v), true) => self.line(&v), // the block's value
+                (Some(v), false) => self.line(&format!("{v};")),
+                (None, _) => {}
+            },
             RawStmt { code } => self.line(code),
-            Entry => {}
+            TemplateStmt { code, holes } => {
+                let t = self.template_text(id, code, holes, 0);
+                self.line(&t);
+            }
+            Entry | BlockEntry { .. } => {}
             _ => {} // pure nodes never sit on an exec chain
         }
     }
@@ -174,7 +193,8 @@ impl<'a> Gen<'a> {
         }
         let Some(id) = last else { return false };
         match self.f.nodes.get(&id).map(|n| &n.kind) {
-            Some(NodeKind::Return) => self.f.data_source(id, 0).is_some(),
+            Some(NodeKind::Return) if !self.container => self.f.data_source(id, 0).is_some(),
+            Some(NodeKind::BlockValue) if self.container => self.f.data_source(id, 0).is_some(),
             Some(NodeKind::If) => {
                 self.f.exec_target(id, 1).is_some()
                     && self.ends_with_return(self.f.exec_target(id, 0), depth + 1)
@@ -266,8 +286,51 @@ impl<'a> Gen<'a> {
             Field { name } => (format!("{}.{name}", paren(inp(0), P_ATOM)), P_ATOM),
             Index => (format!("{}[{}]", paren(inp(0), P_ATOM), inp(1).0), P_ATOM),
             RawExpr { code } => (code.clone(), raw_prec(code)),
+            BlockEntry { binders } => (binders.get(pin).cloned().unwrap_or_default(), P_ATOM),
+            Template { code, holes } => {
+                let t = self.template_text(id, code, holes, depth);
+                let p = raw_prec(&t);
+                (t, p)
+            }
             _ => ("todo!(\"not a value\")".into(), P_ATOM),
         }
+    }
+}
+
+impl<'a> Gen<'a> {
+    /// Fill a template's holes: expression holes from data wires, block holes from their containers.
+    fn template_text(&self, id: NodeId, code: &str, holes: &[Hole], depth: usize) -> String {
+        let mut text = code.to_string();
+        let mut pin = 0;
+        for (i, h) in holes.iter().enumerate() {
+            let fill = if h.block {
+                self.block_text(id, i, h.bare_ok)
+            } else {
+                let v = self.input_d(id, pin, depth);
+                pin += 1;
+                paren(v, h.prec)
+            };
+            text = text.replace(&hole_marker(i), &fill);
+        }
+        text
+    }
+
+    fn block_text(&self, id: NodeId, hole: usize, bare_ok: bool) -> String {
+        let Some(be) = self.f.block_entry(id, hole) else { return "{}".into() };
+        let mut sub = Gen { f: self.f, out: String::new(), visited: HashSet::new(), container: true };
+        let start = self.f.exec_target(be, 0);
+        // a block that's only a value can be written without braces (closure body, match arm)
+        if bare_ok {
+            if let Some(s) = start {
+                if matches!(self.f.nodes.get(&s).map(|n| &n.kind), Some(NodeKind::BlockValue)) {
+                    if let Some(v) = sub.input_opt(s, 0) {
+                        return v;
+                    }
+                }
+            }
+        }
+        sub.chain(start, true);
+        format!("{{\n{}}}", sub.out)
     }
 }
 

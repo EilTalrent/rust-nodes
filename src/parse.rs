@@ -8,6 +8,7 @@ use crate::graph::*;
 use quote::ToTokens;
 use std::collections::HashMap;
 use syn::punctuated::Punctuated;
+use syn::visit_mut::{self, VisitMut};
 use syn::{BinOp, Expr, FnArg, Pat, Stmt, UnOp};
 
 pub fn parse_program(src: &str) -> Result<Program, String> {
@@ -59,12 +60,12 @@ fn convert_item(item: &syn::Item) -> Item {
 pub fn build_fn(name: String, attrs: &[syn::Attribute], vis: &syn::Visibility, sig: &syn::Signature, block: &syn::Block) -> FnGraph {
     let sig_text = signature_text(attrs, vis, sig);
     let params = param_names(sig);
-    let mut b = Builder { g: FnGraph::new(name, sig_text, params.clone()), scopes: vec![HashMap::new()] };
+    let mut b = Builder { g: FnGraph::new(name, sig_text, params.clone()), scopes: vec![HashMap::new()], cur: None };
     let entry = b.g.entry;
     for (i, p) in params.iter().enumerate() {
         b.scopes[0].insert(p.clone(), (entry, i));
     }
-    b.block(&block.stmts, Some((entry, 0)), true);
+    b.block(&block.stmts, Some((entry, 0)), Tail::Return);
     crate::layout::auto_layout(&mut b.g);
     b.g
 }
@@ -101,9 +102,22 @@ pub fn parse_signature(text: &str) -> Result<Vec<String>, String> {
 
 type Port = Option<(NodeId, usize)>;
 
+/// What a tail expression (last expression without `;`) means where we are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// function body: it's the return value
+    Return,
+    /// container block: it's the block's value
+    Value,
+    /// anywhere else: it's just an expression statement
+    None,
+}
+
 struct Builder {
     g: FnGraph,
     scopes: Vec<HashMap<String, (NodeId, usize)>>,
+    /// container new nodes go into
+    cur: Scope,
 }
 
 impl Builder {
@@ -111,8 +125,12 @@ impl Builder {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
 
+    fn add(&mut self, kind: NodeKind) -> NodeId {
+        self.g.add_in(kind, [0.0, 0.0], self.cur)
+    }
+
     fn exec_node(&mut self, kind: NodeKind, port: Port) -> NodeId {
-        let id = self.g.add(kind, [0.0, 0.0]);
+        let id = self.add(kind);
         if let Some((n, p)) = port {
             self.g.connect_exec(n, p, id);
         }
@@ -124,35 +142,89 @@ impl Builder {
         self.g.connect_data(n, p, to, pin);
     }
 
-    fn raw_stmt(&mut self, s: &Stmt, port: Port) -> Port {
-        let id = self.exec_node(NodeKind::RawStmt { code: pretty_stmts(vec![s.clone()]) }, port);
+    /// Statements we have no dedicated node for become template nodes with holes.
+    fn template_stmt(&mut self, s: &Stmt, port: Port) -> Port {
+        let mut col = HoleCollector::default();
+        let mut s2 = s.clone();
+        match &mut s2 {
+            Stmt::Expr(e, _) => col.visit_expr_mut(e),
+            Stmt::Local(l) => {
+                col.in_root = true;
+                col.visit_local_mut(l);
+            }
+            _ => col.failed = true,
+        }
+        if col.failed || col.payloads.is_empty() {
+            let id = self.exec_node(NodeKind::RawStmt { code: pretty_stmts(vec![s.clone()]) }, port);
+            return Some((id, 0));
+        }
+        let code = fill_markers(&pretty_stmts(vec![s2]));
+        let holes = col.holes();
+        let id = self.exec_node(NodeKind::TemplateStmt { code, holes }, port);
+        self.fill_holes(id, col.payloads);
         Some((id, 0))
     }
 
-    fn block(&mut self, stmts: &[Stmt], port: Port, tail_return: bool) -> Port {
+    fn template_expr(&mut self, e: &Expr) -> (NodeId, usize) {
+        let mut col = HoleCollector::default();
+        let mut e2 = e.clone();
+        col.visit_expr_mut(&mut e2);
+        if col.failed || col.payloads.is_empty() {
+            return self.pure(NodeKind::RawExpr { code: pretty_expr(e) }, &[]);
+        }
+        let code = fill_markers(&pretty_expr(&e2));
+        let holes = col.holes();
+        let id = self.add(NodeKind::Template { code, holes });
+        self.fill_holes(id, col.payloads);
+        (id, 0)
+    }
+
+    /// Wire expression holes and build a sub-graph for each block hole.
+    fn fill_holes(&mut self, id: NodeId, payloads: Vec<Payload>) {
+        let mut pin = 0;
+        for (i, p) in payloads.into_iter().enumerate() {
+            match p {
+                Payload::Expr(e, _) => {
+                    self.wire(&e, id, pin);
+                    pin += 1;
+                }
+                Payload::Block { stmts, binders, .. } => {
+                    let saved = self.cur;
+                    self.cur = Some((id, i));
+                    let be = self.add(NodeKind::BlockEntry { binders: binders.clone() });
+                    self.scopes.push(binders.iter().enumerate().map(|(j, b)| (b.clone(), (be, j))).collect());
+                    self.block(&stmts, Some((be, 0)), Tail::Value);
+                    self.scopes.pop();
+                    self.cur = saved;
+                }
+            }
+        }
+    }
+
+    fn block(&mut self, stmts: &[Stmt], port: Port, tail: Tail) -> Port {
         self.scopes.push(HashMap::new());
         let mut port = port;
         for (i, s) in stmts.iter().enumerate() {
             let last = i + 1 == stmts.len();
-            port = self.stmt(s, port, tail_return && last);
+            port = self.stmt(s, port, if last { tail } else { Tail::None });
         }
         self.scopes.pop();
         port
     }
 
-    fn stmt(&mut self, s: &Stmt, port: Port, tail_ctx: bool) -> Port {
+    fn stmt(&mut self, s: &Stmt, port: Port, tail: Tail) -> Port {
         match s {
             Stmt::Local(local) => {
                 if local.init.as_ref().is_some_and(|i| i.diverge.is_some()) {
-                    return self.raw_stmt(s, port); // let-else
+                    return self.template_stmt(s, port); // let-else
                 }
                 let (pat, ty) = match &local.pat {
                     Pat::Type(pt) => (&*pt.pat, pretty_type(&pt.ty)),
                     p => (p, String::new()),
                 };
-                let Pat::Ident(pi) = pat else { return self.raw_stmt(s, port) };
+                let Pat::Ident(pi) = pat else { return self.template_stmt(s, port) };
                 if pi.by_ref.is_some() || pi.subpat.is_some() {
-                    return self.raw_stmt(s, port);
+                    return self.template_stmt(s, port);
                 }
                 let name = pi.ident.to_string();
                 let id = self.exec_node(NodeKind::Let { name: name.clone(), mutable: pi.mutability.is_some(), ty }, port);
@@ -162,66 +234,61 @@ impl Builder {
                 self.scopes.last_mut().unwrap().insert(name, (id, 0));
                 Some((id, 0))
             }
-            Stmt::Item(_) => self.raw_stmt(s, port),
+            Stmt::Item(_) => {
+                let id = self.exec_node(NodeKind::RawStmt { code: pretty_stmts(vec![s.clone()]) }, port);
+                Some((id, 0))
+            }
             Stmt::Macro(m) => {
                 let id = self.exec_node(NodeKind::Eval, port);
                 let (n, p) = self.macro_node(&m.mac);
                 self.g.connect_data(n, p, id, 0);
                 Some((id, 0))
             }
-            Stmt::Expr(e, semi) => self.expr_stmt(s, e, port, tail_ctx && semi.is_none(), tail_ctx),
+            Stmt::Expr(e, semi) => {
+                let value_tail = if semi.is_none() { tail } else { Tail::None };
+                self.expr_stmt(s, e, port, value_tail)
+            }
         }
     }
 
-    /// `value_tail`: this expression is the function's return value.
-    /// `tail_ctx`: we're in tail position of the function (branch tails are return values).
-    fn expr_stmt(&mut self, s: &Stmt, e: &Expr, port: Port, value_tail: bool, tail_ctx: bool) -> Port {
+    /// `value_tail`: what this expression's value means (Return/Value), or None if it's discarded.
+    fn expr_stmt(&mut self, s: &Stmt, e: &Expr, port: Port, value_tail: Tail) -> Port {
+        let is_tail = value_tail != Tail::None;
         match e {
-            Expr::If(ei) => {
-                if matches!(&*ei.cond, Expr::Let(_)) {
-                    return self.raw_stmt(s, port);
-                }
+            Expr::If(ei) if !matches!(&*ei.cond, Expr::Let(_)) && !contains_let(&ei.cond) => {
                 let id = self.exec_node(NodeKind::If, port);
                 self.wire(&ei.cond, id, 0);
                 self.block(&ei.then_branch.stmts, Some((id, 0)), value_tail);
                 if let Some((_, els)) = &ei.else_branch {
+                    let inner = Stmt::Expr((**els).clone(), None);
                     match &**els {
-                        Expr::Block(b) if b.label.is_none() => {
+                        Expr::Block(b) if b.label.is_none() && b.attrs.is_empty() => {
                             self.block(&b.block.stmts, Some((id, 1)), value_tail);
                         }
-                        Expr::If(_) => {
-                            let inner = Stmt::Expr((**els).clone(), None);
-                            self.expr_stmt(&inner, els, Some((id, 1)), value_tail, tail_ctx);
-                        }
                         _ => {
-                            let inner = Stmt::Expr((**els).clone(), None);
-                            self.raw_stmt(&inner, Some((id, 1)));
+                            self.expr_stmt(&inner, els, Some((id, 1)), value_tail);
                         }
                     }
                 }
                 Some((id, 2))
             }
-            Expr::While(w) if w.label.is_none() && !matches!(&*w.cond, Expr::Let(_)) => {
+            Expr::While(w) if w.label.is_none() && !contains_let(&w.cond) => {
                 let id = self.exec_node(NodeKind::While, port);
                 self.wire(&w.cond, id, 0);
-                self.block(&w.body.stmts, Some((id, 0)), false);
+                self.block(&w.body.stmts, Some((id, 0)), Tail::None);
                 Some((id, 1))
             }
-            Expr::Loop(l) if l.label.is_none() && !value_tail => {
+            Expr::Loop(l) if l.label.is_none() && !is_tail => {
                 let id = self.exec_node(NodeKind::Loop, port);
-                self.block(&l.body.stmts, Some((id, 0)), false);
+                self.block(&l.body.stmts, Some((id, 0)), Tail::None);
                 Some((id, 1))
             }
-            Expr::ForLoop(f) if f.label.is_none() => {
-                let Pat::Ident(pi) = &*f.pat else { return self.raw_stmt(s, port) };
-                if pi.by_ref.is_some() || pi.subpat.is_some() || pi.mutability.is_some() {
-                    return self.raw_stmt(s, port);
-                }
-                let var = pi.ident.to_string();
+            Expr::ForLoop(f) if f.label.is_none() && simple_ident(&f.pat).is_some() => {
+                let var = simple_ident(&f.pat).unwrap();
                 let id = self.exec_node(NodeKind::For { var: var.clone() }, port);
                 self.wire(&f.expr, id, 0);
                 self.scopes.push(HashMap::from([(var, (id, 0))]));
-                self.block(&f.body.stmts, Some((id, 0)), false);
+                self.block(&f.body.stmts, Some((id, 0)), Tail::None);
                 self.scopes.pop();
                 Some((id, 1))
             }
@@ -240,25 +307,31 @@ impl Builder {
                 self.exec_node(NodeKind::Continue, port);
                 None
             }
-            Expr::Assign(a) if !value_tail => {
+            Expr::Assign(a) if !is_tail => {
                 let id = self.exec_node(NodeKind::Assign { op: "=".into() }, port);
                 self.wire(&a.left, id, 0);
                 self.wire(&a.right, id, 1);
                 Some((id, 0))
             }
-            Expr::Binary(b) if is_assign_op(&b.op) && !value_tail => {
+            Expr::Binary(b) if is_assign_op(&b.op) && !is_tail => {
                 let id = self.exec_node(NodeKind::Assign { op: b.op.to_token_stream().to_string() }, port);
                 self.wire(&b.left, id, 0);
                 self.wire(&b.right, id, 1);
                 Some((id, 0))
             }
-            Expr::Block(_) | Expr::Unsafe(_) | Expr::Match(_) | Expr::Loop(_) | Expr::While(_) | Expr::ForLoop(_)
-            | Expr::Break(_) | Expr::Const(_) | Expr::TryBlock(_) => self.raw_stmt(s, port),
-            _ if value_tail => {
+            _ if value_tail == Tail::Return => {
                 let id = self.exec_node(NodeKind::Return, port);
                 self.wire(e, id, 0);
                 None
             }
+            _ if value_tail == Tail::Value => {
+                let id = self.exec_node(NodeKind::BlockValue, port);
+                self.wire(e, id, 0);
+                None
+            }
+            // statement-like constructs without a dedicated node
+            Expr::If(_) | Expr::While(_) | Expr::Loop(_) | Expr::ForLoop(_) | Expr::Block(_) | Expr::Unsafe(_)
+            | Expr::Match(_) | Expr::Break(_) | Expr::Const(_) | Expr::TryBlock(_) => self.template_stmt(s, port),
             _ => {
                 let id = self.exec_node(NodeKind::Eval, port);
                 self.wire(e, id, 0);
@@ -268,7 +341,7 @@ impl Builder {
     }
 
     fn pure(&mut self, kind: NodeKind, inputs: &[&Expr]) -> (NodeId, usize) {
-        let id = self.g.add(kind, [0.0, 0.0]);
+        let id = self.add(kind);
         for (i, e) in inputs.iter().enumerate() {
             self.wire(e, id, i);
         }
@@ -294,7 +367,7 @@ impl Builder {
                     UnOp::Deref(_) => "*",
                     UnOp::Not(_) => "!",
                     UnOp::Neg(_) => "-",
-                    _ => return self.raw_expr(e),
+                    _ => return self.template_expr(e),
                 };
                 self.pure(NodeKind::Unary { op: op.into() }, &[&u.expr])
             }
@@ -322,12 +395,8 @@ impl Builder {
             Expr::Index(i) => self.pure(NodeKind::Index, &[&i.expr, &i.index]),
             Expr::Paren(p) => self.expr(&p.expr),
             Expr::Group(g) => self.expr(&g.expr),
-            _ => self.raw_expr(e),
+            _ => self.template_expr(e),
         }
-    }
-
-    fn raw_expr(&mut self, e: &Expr) -> (NodeId, usize) {
-        self.pure(NodeKind::RawExpr { code: pretty_expr(e) }, &[])
     }
 
     fn macro_node(&mut self, mac: &syn::Macro) -> (NodeId, usize) {
@@ -349,8 +418,238 @@ impl Builder {
 
     fn raw_macro(&mut self, mac: &syn::Macro) -> (NodeId, usize) {
         let e = Expr::Macro(syn::ExprMacro { attrs: vec![], mac: mac.clone() });
-        self.raw_expr(&e)
+        self.pure(NodeKind::RawExpr { code: pretty_expr(&e) }, &[])
     }
+}
+
+fn simple_ident(p: &Pat) -> Option<String> {
+    match p {
+        Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() && pi.mutability.is_none() => Some(pi.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn contains_let(e: &Expr) -> bool {
+    match e {
+        Expr::Let(_) => true,
+        Expr::Binary(b) => contains_let(&b.left) || contains_let(&b.right),
+        Expr::Paren(p) => contains_let(&p.expr),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Turning any construct into a template with holes.
+
+const HOLE: &str = "__rust_nodes_hole_";
+
+enum Payload {
+    Expr(Expr, u8),
+    Block { stmts: Vec<Stmt>, binders: Vec<String>, bare_ok: bool },
+}
+
+/// Walks one construct and replaces its direct sub-expressions with hole placeholders.
+/// Blocks become container holes; variables bound by patterns (match arms, closures,
+/// `if let`, `while let`, `for`) become inputs of that container.
+#[derive(Default)]
+struct HoleCollector {
+    in_root: bool,
+    failed: bool,
+    payloads: Vec<Payload>,
+}
+
+fn placeholder(i: usize) -> Expr {
+    let ident = syn::Ident::new(&format!("{HOLE}{i}"), proc_macro2::Span::call_site());
+    syn::parse_quote!(#ident)
+}
+
+fn is_placeholder(e: &Expr) -> bool {
+    matches!(e, Expr::Path(p) if p.path.get_ident().is_some_and(|i| i.to_string().starts_with(HOLE)))
+}
+
+fn block_is_placeholder(b: &syn::Block) -> bool {
+    matches!(b.stmts.as_slice(), [Stmt::Expr(e, None)] if is_placeholder(e))
+}
+
+/// Variable names bound by a pattern.
+fn pat_binders(p: &Pat) -> Vec<String> {
+    struct V(Vec<String>);
+    impl<'a> syn::visit::Visit<'a> for V {
+        fn visit_pat_ident(&mut self, i: &'a syn::PatIdent) {
+            let name = i.ident.to_string();
+            // Uppercase idents in patterns are usually constants/unit variants, not bindings.
+            if !name.starts_with(|c: char| c.is_uppercase()) && !self.0.contains(&name) {
+                self.0.push(name);
+            }
+            syn::visit::visit_pat_ident(self, i);
+        }
+    }
+    let mut v = V(vec![]);
+    syn::visit::Visit::visit_pat(&mut v, p);
+    v.0
+}
+
+impl HoleCollector {
+    fn holes(&self) -> Vec<Hole> {
+        self.payloads
+            .iter()
+            .map(|p| match p {
+                Payload::Expr(_, prec) => Hole { block: false, binders: vec![], bare_ok: false, prec: *prec },
+                Payload::Block { binders, bare_ok, .. } => {
+                    Hole { block: true, binders: binders.clone(), bare_ok: *bare_ok, prec: 0 }
+                }
+            })
+            .collect()
+    }
+
+    fn expr_hole(&mut self, e: &mut Expr) {
+        let i = self.payloads.len();
+        let old = std::mem::replace(e, placeholder(i));
+        let prec = expr_prec(&old);
+        self.payloads.push(Payload::Expr(old, prec));
+    }
+
+    /// Turn an expression-position body (closure body, match arm) into a container.
+    fn body_hole(&mut self, e: &mut Expr, binders: Vec<String>) {
+        let i = self.payloads.len();
+        let old = std::mem::replace(e, placeholder(i));
+        let stmts = match old {
+            Expr::Block(b) if b.label.is_none() && b.attrs.is_empty() => b.block.stmts,
+            other => vec![Stmt::Expr(other, None)],
+        };
+        self.payloads.push(Payload::Block { stmts, binders, bare_ok: true });
+    }
+
+    /// Turn a `{ ... }` block into a container.
+    fn block_hole(&mut self, b: &mut syn::Block, binders: Vec<String>) {
+        if block_is_placeholder(b) {
+            return;
+        }
+        let i = self.payloads.len();
+        let stmts = std::mem::replace(&mut b.stmts, vec![Stmt::Expr(placeholder(i), None)]);
+        self.payloads.push(Payload::Block { stmts, binders, bare_ok: false });
+    }
+
+    /// Special handling for the construct itself: constructs that bind variables.
+    fn root(&mut self, e: &mut Expr) {
+        match e {
+            Expr::Closure(c) => {
+                let binders = c.inputs.iter().flat_map(pat_binders).collect();
+                self.body_hole(&mut c.body, binders);
+            }
+            Expr::Match(m) => {
+                self.expr_hole(&mut m.expr);
+                for arm in &mut m.arms {
+                    let binders = pat_binders(&arm.pat);
+                    if let Some((_, g)) = &mut arm.guard {
+                        self.expr_hole(g);
+                    }
+                    self.body_hole(&mut arm.body, binders);
+                }
+            }
+            Expr::If(i) => {
+                if let Expr::Let(l) = &mut *i.cond {
+                    let binders = pat_binders(&l.pat);
+                    self.expr_hole(&mut l.expr);
+                    self.block_hole(&mut i.then_branch, binders);
+                } else if contains_let(&i.cond) {
+                    self.failed = true; // let-chains: keep as raw code
+                }
+            }
+            Expr::While(w) => {
+                if let Expr::Let(l) = &mut *w.cond {
+                    let binders = pat_binders(&l.pat);
+                    self.expr_hole(&mut l.expr);
+                    self.block_hole(&mut w.body, binders);
+                } else if contains_let(&w.cond) {
+                    self.failed = true;
+                }
+            }
+            Expr::ForLoop(f) => {
+                let binders = pat_binders(&f.pat);
+                self.expr_hole(&mut f.expr);
+                self.block_hole(&mut f.body, binders);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl VisitMut for HoleCollector {
+    fn visit_expr_mut(&mut self, e: &mut Expr) {
+        if self.failed || is_placeholder(e) {
+            return;
+        }
+        if !self.in_root {
+            self.in_root = true;
+            self.root(e);
+            visit_mut::visit_expr_mut(self, e); // remaining direct children become holes
+            return;
+        }
+        match e {
+            // `if let` scrutinee already handled
+            Expr::Let(l) if is_placeholder(&l.expr) => {}
+            Expr::Let(_) => self.failed = true,
+            Expr::Block(b) if b.label.is_none() && b.attrs.is_empty() => {
+                let i = self.payloads.len();
+                let old = std::mem::replace(e, placeholder(i));
+                let Expr::Block(b) = old else { unreachable!() };
+                self.payloads.push(Payload::Block { stmts: b.block.stmts, binders: vec![], bare_ok: false });
+            }
+            _ => self.expr_hole(e),
+        }
+    }
+    fn visit_block_mut(&mut self, b: &mut syn::Block) {
+        self.block_hole(b, vec![]);
+    }
+    fn visit_field_value_mut(&mut self, f: &mut syn::FieldValue) {
+        // `Foo { x }` shorthand must become `Foo { x: <hole> }`
+        if f.colon_token.is_none() {
+            f.colon_token = Some(Default::default());
+        }
+        visit_mut::visit_field_value_mut(self, f);
+    }
+    // Patterns, types, attributes and macro tokens stay as written.
+    fn visit_pat_mut(&mut self, _: &mut Pat) {}
+    fn visit_type_mut(&mut self, _: &mut syn::Type) {}
+    fn visit_attribute_mut(&mut self, _: &mut syn::Attribute) {}
+    fn visit_macro_mut(&mut self, _: &mut syn::Macro) {}
+}
+
+/// Precedence of an expression, matching the table in codegen.
+fn expr_prec(e: &Expr) -> u8 {
+    use crate::codegen::{bin_prec, P_ATOM, P_LOWEST, P_UNARY};
+    match e {
+        Expr::Binary(b) => bin_prec(&b.op.to_token_stream().to_string()),
+        Expr::Unary(_) | Expr::Reference(_) => P_UNARY,
+        Expr::Cast(_) => 12,
+        Expr::Range(_) | Expr::Assign(_) | Expr::Closure(_) | Expr::Return(_) | Expr::Break(_) | Expr::Let(_) => P_LOWEST,
+        _ => P_ATOM,
+    }
+}
+
+/// Replace hole placeholders in printed code with ⟦n⟧ markers.
+/// `{ hole }` (a block that is only a placeholder) becomes just the marker.
+fn fill_markers(code: &str) -> String {
+    let mut out = String::new();
+    let mut rest = code;
+    while let Some(pos) = rest.find(HOLE) {
+        let (before, after) = rest.split_at(pos);
+        let digits: String = after[HOLE.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let mut tail = &after[HOLE.len() + digits.len()..];
+        let mut before = before.to_string();
+        // collapse "{ <hole> }"
+        let trimmed = before.trim_end();
+        if trimmed.ends_with('{') && tail.trim_start().starts_with('}') {
+            before.truncate(trimmed.len() - 1);
+            tail = &tail.trim_start()[1..];
+        }
+        out.push_str(&before);
+        out.push_str(&hole_marker(digits.parse().unwrap_or(0)));
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_assign_op(op: &BinOp) -> bool {

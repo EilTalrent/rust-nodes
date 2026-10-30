@@ -41,7 +41,7 @@ On Linux you may need the usual egui/winit system packages (X11/Wayland and Open
 
 * **The `.rs` file is always the source of truth.** Other people can use a normal text editor, and git diffs stay readable.
 * Node positions are stored next to it in `your_file.rs.nodes.json`. If the `.rs` was changed in a text editor, it is re-read and positions are kept where the structure still matches.
-* Anything the graph can't show yet is kept as a **raw Rust node** (a node that holds code), so opening and saving a file never loses code.
+* Anything without a dedicated node becomes a **template node** with holes (see below), so opening and saving a file never loses code.
 
 ### Rust → nodes
 
@@ -58,9 +58,34 @@ On Linux you may need the usual egui/winit system packages (X11/Wayland and Open
 | `a + b`, `!x`, `&x`, `&mut x`, `*x` | operator nodes (parentheses are added automatically from precedence) |
 | `f(a)`, `x.method(a)`, `println!(…)`, `x.field`, `x[i]` | call / method / macro / field / index nodes |
 | `impl` blocks | each method is its own graph (`Type::method`) |
-| `match`, closures, `if let`, labelled loops, structs/enums/traits … | kept as raw Rust (for now) |
+| `match`, closures, `if let`, `while let`, let-else, struct literals, ranges, `?`, labelled loops … | **template nodes** with holes and **containers** (below) |
+| structs, enums, traits, `use` … | kept as Rust code around the graphs |
 
 Shadowing works naturally: in `let x = 1; let x = x + 1;` the second `let` is wired to the first.
+
+## Template nodes and containers
+
+Rust has far more syntax than any fixed set of nodes. So instead of giving up on unfamiliar code, rust-nodes uses `syn`'s full syntax tree to break **any** construct into a **template**: the construct's own code with numbered holes cut out of it.
+
+* **Expression holes** (⓪ ① …) are inputs. Whatever was there becomes ordinary nodes wired in.
+* **Block holes** are **containers**: a sub-graph of their own. Click **▶ open** on the node (or double-click it) to go inside. A breadcrumb at the top takes you back out, and **Esc** goes up one level.
+* Variables the construct creates for the block (`v` in `Some(v) => …`, `x` in `|x| …`, `(a, b)` in `if let`) come out of the container's **Block start** node as wires.
+* The block's value (a match arm's or closure's result) goes into the **Result** node.
+* A value used inside a container but defined outside it (like a closure capturing `offset`) gets a small `offset ›` label at the input.
+
+```rust
+match s {
+    Shape::Circle { r } => 3.14 * r * r,
+    Shape::Rect { w, h } if *w > 0.0 => { let a = w * h; a }
+    Shape::Dot => 0.0,
+}
+```
+becomes one node, `match ⓪ { Shape::Circle { r } => ①, Shape::Rect { w, h } if ② => ③, Shape::Dot => ④ }`. Hole ⓪ is wired from `s`, ② from a `*w > 0.0` node graph, and ①, ③ and ④ are containers:
+
+![A match as a template node](docs/template.png)
+![Inside the second arm: w and h come from Block start](docs/container.png)
+
+This is similar to Unreal's collapsed graphs, Blender node groups and Houdini subnetworks, combined with Scratch/Blockly-style "code with slots". Templates nest freely: a closure inside a `match` arm inside a `for` is a container inside a container. The only code still kept as plain text is code with nothing inside it to split out, like `break 'outer;`.
 
 ## Using the editor
 
@@ -69,6 +94,7 @@ Shadowing works naturally: in `let x = 1; let x = x + 1;` the second `let` is wi
 * **Drag a wire into empty space** → the add menu opens, showing only nodes that fit, and the new node is connected for you
 * **Drag from a connected input** → pick the wire back up
 * **Drag a node header** → move it · **Delete/Backspace** → delete · right-click a node → Delete / Duplicate
+* **▶ open** rows / **double-click** a template → go into a container · breadcrumb or **Esc** → back out
 * **Scroll** → zoom · **drag the background** → pan
 * **Inspector** (right) edits the selected node: names, operators, argument counts, raw code…
 * **Generated Rust** (right) updates live as you edit
@@ -103,6 +129,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 
 * Comments inside function bodies are lost when the editor saves. Doc comments and attributes on items are kept.
 * A value node wired into several places is written out at each use. Use a `let` to compute something once.
+* Inside templates, names bound by patterns and used in guard expressions (e.g. `*w > 0.0`) are matched by name, not by wire. The same goes for calling a closure stored in a variable (`add(1, 2)`).
+* Editing a template's code by hand works, but keep the `⟦n⟧` hole markers.
 * Compile errors appear in the output panel but aren't highlighted on the nodes yet.
 * No undo yet.
 
@@ -111,8 +139,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 - [ ] Map `cargo` errors (they come with line numbers) back onto nodes and highlight them
 - [ ] Type info from rust-analyzer: colour pins by type, catch bad wires before compiling
 - [ ] Auto-generate nodes for every function in a crate (via rustdoc JSON) so you can search the whole ecosystem
-- [ ] `match` and `if let` nodes with one exec pin per arm
-- [ ] Closures as collapsible sub-graphs
+- [ ] Dedicated `match` / `if let` nodes with one exec pin per arm (on top of the generic templates)
+- [ ] "Collapse selection to container" and "expand container" commands
 - [ ] Undo/redo, copy/paste, comment boxes, reroute nodes
 - [ ] Keep comments by storing them on nodes
 - [ ] Other backends (C, direct LLVM via `inkwell`) using the same graph

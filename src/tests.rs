@@ -76,3 +76,44 @@ fn unsupported_code_is_kept_raw() {
     let out = roundtrip(src);
     assert!(out.contains("match o"), "{out}");
 }
+
+#[test]
+fn containers_roundtrip() {
+    check_file("examples/samples/containers.rs");
+}
+
+#[test]
+fn match_becomes_template_with_containers() {
+    let p = parse_program("fn f(o: Option<i32>) -> i32 { match o { Some(v) => v * 2, None => 0 } }").unwrap();
+    let f = p.functions()[0].1.clone();
+    let (mid, m) = f.nodes.iter().find(|(_, n)| matches!(n.kind, NodeKind::Template { .. })).unwrap();
+    let NodeKind::Template { code, holes } = &m.kind else { unreachable!() };
+    assert_eq!(code, "match ⟦0⟧ {\n    Some(v) => ⟦1⟧,\n    None => ⟦2⟧,\n}");
+    assert!(!holes[0].block && holes[1].block && holes[2].block);
+    assert_eq!(holes[1].binders, vec!["v".to_string()]);
+    // the scrutinee hole is wired to the parameter `o`
+    assert_eq!(f.data_source(*mid, 0), Some((f.entry, 0)));
+    // inside arm 1, `v * 2` uses the container's `v` output
+    let be = f.block_entry(*mid, 1).unwrap();
+    let mul = f.nodes.iter().find(|(_, n)| matches!(&n.kind, NodeKind::Binary { op } if op == "*")).unwrap();
+    assert_eq!(mul.1.scope, Some((*mid, 1)));
+    assert_eq!(f.data_source(*mul.0, 0), Some((be, 0)));
+    // and it regenerates without braces
+    let out = generate(&p).code;
+    assert!(out.contains("Some(v) => v * 2,"), "{out}");
+}
+
+#[test]
+fn closure_captures_outer_variable() {
+    let out = roundtrip("fn f() -> i32 { let k = 3; let add = |a: i32| a + k; add(1) }");
+    assert!(out.contains("let add = |a: i32| a + k;"), "{out}");
+}
+
+#[test]
+fn deleting_a_container_deletes_its_inside() {
+    let p = parse_program("fn f(o: Option<i32>) -> i32 { match o { Some(v) => v * 2, None => 0 } }").unwrap();
+    let mut f = p.functions()[0].1.clone();
+    let mid = *f.nodes.iter().find(|(_, n)| matches!(n.kind, NodeKind::Template { .. })).unwrap().0;
+    f.remove(mid);
+    assert!(f.nodes.values().all(|n| n.scope.is_none()), "inner nodes left behind");
+}
