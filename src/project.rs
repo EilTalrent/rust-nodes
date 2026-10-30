@@ -60,6 +60,10 @@ pub fn open(path: &Path) -> Result<Loaded, String> {
 /// Write the generated Rust and the sidecar. Returns the generated code.
 pub fn save(path: &Path, program: &Program) -> Result<Generated, String> {
     let generated = generate(program);
+    // never overwrite the user's file with code that doesn't parse
+    if let Some(e) = &generated.error {
+        return Err(format!("not saved: the generated code has a syntax error ({e}). Your file was left unchanged."));
+    }
     std::fs::write(path, &generated.code).map_err(|e| format!("can't write {}: {e}", path.display()))?;
     let side = Sidecar { source_hash: hash_text(&generated.code), program: program.clone() };
     let json = serde_json::to_string_pretty(&side).map_err(|e| e.to_string())?;
