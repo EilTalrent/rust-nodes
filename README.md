@@ -59,9 +59,22 @@ On Linux you may need the usual egui/winit system packages (X11/Wayland and Open
 | `f(a)`, `x.method(a)`, `println!(…)`, `x.field`, `x[i]` | call / method / macro / field / index nodes |
 | `impl` blocks | each method is its own graph (`Type::method`) |
 | `match`, closures, `if let`, `while let`, let-else, struct literals, ranges, `?`, labelled loops … | **template nodes** with holes and **containers** (below) |
-| structs, enums, traits, `use` … | kept as Rust code around the graphs |
+| `use`, `const`, `mod`, structs, enums, traits … | cards in the **File overview** (editable, wired to what uses them) |
 
 Shadowing works naturally: in `let x = 1; let x = x + 1;` the second `let` is wired to the first.
+
+## File overview: every item as a node
+
+**▣ File overview** (top of the left panel) shows *everything* in the file as cards, in file order. That includes the `//!` docs, `use`, `const`/`static`, `mod`, `struct` (with its fields), `enum` (with its variants), `trait`, `type`, macros, functions, `impl` blocks (one ▶ row per method), and your `//` section comments.
+
+* **Lines show what uses what**: a `use` is wired to every item that uses a name it imports, a `const` to every function that reads it, a `struct` to its `impl`, and so on. Selecting a card brings its wires to the front.
+* **Click a card** to edit it in the inspector. `use`, `const`/`static`, `mod`, `struct` fields, `enum` variants and `type` aliases get proper fields (doc comments and attributes are kept); anything else gets a code box. Edits are only applied once they're valid Rust.
+* **▲ Move up / ▼ Move down / Delete** reorder or remove items. **Right-click** the canvas to add a `use`, `const`, `static`, `struct`, `enum`, `type`, `mod`, comment or a new function.
+* **▶ open graph** (or double-click) jumps into a function, and **▶ open tree.rs** on a `mod tree;` card opens that file.
+* The selected card's code is highlighted in the card's colour in the Generated Rust panel.
+
+![File overview of claude-term](docs/file-overview.png)
+![Editing a const; its code is highlighted](docs/file-overview-const.png)
 
 ## Template nodes and containers
 
@@ -162,6 +175,7 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 | `src/layout.rs` | node geometry and automatic layout |
 | `src/project.rs` | open/save, layout sidecar, finding the cargo project |
 | `src/extract.rs` | turning a group into a function: parameters, returns, `&mut`, safety checks, type probes |
+| `src/fileview.rs` | the File overview: item cards, "used by" wires, item inspector |
 | `src/highlight.rs` | Rust syntax highlighter for the code panel, with node-coloured highlight ranges |
 | `src/compiler.rs` | running `cargo check` / `rustc` on a scratch copy and reading types from its errors |
 | `src/editor.rs` | the node canvas and inspector (`egui`) |

@@ -7,6 +7,7 @@ use crate::graph::*;
 use crate::parse::parse_signature;
 use crate::codegen;
 use crate::extract;
+use crate::fileview;
 use crate::highlight;
 use crate::project;
 use eframe::egui;
@@ -48,6 +49,12 @@ struct App {
     has_file: bool,
     /// "Extract function" dialog
     extract: Option<ExtractDialog>,
+    /// the File overview (every item as a card) is showing instead of a function graph
+    show_file: bool,
+    file_view: fileview::FileView,
+    /// file view / item ranges need rebuilding (program or code changed)
+    views_dirty: bool,
+    item_ranges: std::collections::HashMap<usize, std::ops::Range<usize>>,
     /// what the code view last highlighted (to scroll only when the selection changes)
     last_marked: Option<(Vec<usize>, std::collections::BTreeSet<NodeId>, usize)>,
     pending_ask: bool,
@@ -75,6 +82,10 @@ impl App {
             running: Arc::new(AtomicBool::new(false)),
             has_file: false,
             extract: None,
+            show_file: false,
+            file_view: fileview::FileView::default(),
+            views_dirty: true,
+            item_ranges: Default::default(),
             last_marked: None,
             pending_ask: false,
             show_prompt: true,
@@ -216,6 +227,8 @@ impl App {
                 self.editors.clear();
                 self.unsaved = false;
                 self.code = generate(&self.program);
+                self.views_dirty = true;
+                self.file_view = fileview::FileView::default();
                 self.select_first();
             }
             Err(e) => self.status = format!("Open failed: {e}"),
@@ -325,6 +338,80 @@ impl App {
         self.mark_changed();
     }
 
+    /// Rebuild the File overview cards and item code ranges if the program changed.
+    fn refresh_views(&mut self) {
+        if !self.views_dirty {
+            return;
+        }
+        self.views_dirty = false;
+        let dir = self.path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        self.file_view.refresh(&self.program, dir.as_deref());
+        self.item_ranges = fileview::item_ranges(&self.program, &self.code.code);
+    }
+
+    /// After items were added/moved/removed: function paths may have shifted, so
+    /// find the current function again by name and drop per-function view state.
+    fn items_reshaped(&mut self, current_name: Option<String>) {
+        self.editors.clear();
+        self.file_view.reset_editing();
+        if let Some(name) = current_name {
+            if let Some((p, _)) = self.program.functions().into_iter().find(|(_, f)| f.name == name) {
+                self.current = p;
+            }
+        }
+        if self.program.function_mut(&self.current.clone()).is_none() {
+            self.select_first();
+        }
+        self.load_sig();
+        self.mark_changed();
+    }
+
+    fn current_name(&self) -> Option<String> {
+        self.program.functions().into_iter().find(|(p, _)| *p == self.current).map(|(_, f)| f.name.clone())
+    }
+
+    /// Handle something a File overview card asked to open.
+    fn handle_open(&mut self) {
+        let Some(req) = self.file_view.open_request.take() else { return };
+        match req {
+            fileview::Open::Function(path) => {
+                if self.program.function_mut(&path).is_some() {
+                    self.current = path;
+                    self.show_file = false;
+                    self.load_sig();
+                }
+            }
+            fileview::Open::File(file) => {
+                if self.unsaved && !self.save() {
+                    return;
+                }
+                self.path_text = file;
+                if let Err(e) = self.open_or_create(false) {
+                    self.status = e;
+                }
+            }
+        }
+    }
+
+    /// Insert a new item from the File overview's add menu (after the selected card).
+    fn add_item(&mut self, template: &str) {
+        let name = self.current_name();
+        let at = self.file_view.selected.and_then(|s| self.file_view.cards.get(s)).map(|c| c.idx + 1).unwrap_or(self.program.items.len());
+        let item = if template == "fn" {
+            let n = self.program.functions().len();
+            let fname = format!("new_function_{n}");
+            Item::Func(FnGraph::new(fname.clone(), format!("fn {fname}()"), vec![]))
+        } else if template.starts_with("//") {
+            Item::Comment(format!("{template}\n"))
+        } else {
+            Item::Raw(template.to_string())
+        };
+        self.program.items.insert(at.min(self.program.items.len()), item);
+        self.items_reshaped(name);
+        self.refresh_views();
+        self.file_view.selected = self.file_view.cards.iter().position(|c| c.idx == at);
+    }
+
     fn take_extract_request(&mut self, path: &[usize]) {
         let Some(g) = self.editors.get_mut(path).and_then(|e| e.extract_request.take()) else { return };
         let Some(f) = self.program.function_mut(path) else { return };
@@ -338,6 +425,7 @@ impl App {
     }
 
     fn mark_changed(&mut self) {
+        self.views_dirty = true;
         self.unsaved = true;
         self.code = generate(&self.program);
     }
@@ -526,6 +614,15 @@ impl App {
     /// Code ranges to paint for the current selection, each in its node's colour.
     fn selection_marks(&self) -> Vec<(std::ops::Range<usize>, egui::Color32)> {
         let mut marks = vec![];
+        if self.show_file {
+            if let Some(card) = self.file_view.selected.and_then(|s| self.file_view.cards.get(s)) {
+                if let Some(r) = self.item_ranges.get(&card.idx) {
+                    let c = card_color(card.kind);
+                    marks.push((r.clone(), egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150)));
+                }
+            }
+            return marks;
+        }
         let (Some(fi), Some(ed)) = (self.current_fi(), self.editors.get(&self.current)) else { return marks };
         let Some((_, f)) = self.program.functions().into_iter().find(|(p, _)| *p == self.current) else { return marks };
         let code = &self.code.code;
@@ -564,7 +661,11 @@ impl App {
     /// scrolled into view when the selection changes; click a line to select its node.
     fn code_view(&mut self, ui: &mut egui::Ui) {
         let marks = self.selection_marks();
-        let key = (self.current.clone(), self.editors.get(&self.current).map(|e| e.multi.clone()).unwrap_or_default(), self.code.code.len());
+        let mut sel = self.editors.get(&self.current).map(|e| e.multi.clone()).unwrap_or_default();
+        if self.show_file {
+            sel = self.file_view.selected.map(|s| std::collections::BTreeSet::from([u32::MAX - s as u32])).unwrap_or_default();
+        }
+        let key = (self.current.clone(), sel, self.code.code.len());
         let scroll_to_selection = self.last_marked.as_ref() != Some(&key) && !marks.is_empty();
         self.last_marked = Some(key);
         let code = self.code.code.clone();
@@ -614,6 +715,19 @@ impl App {
             self.load_sig();
         }
         self.editors.entry(path).or_default().reveal(&f, id);
+    }
+}
+
+fn card_color(k: fileview::CardKind) -> egui::Color32 {
+    use fileview::CardKind::*;
+    match k {
+        Use => egui::Color32::from_rgb(70, 95, 140),
+        Const | Static => egui::Color32::from_rgb(150, 110, 30),
+        Mod => egui::Color32::from_rgb(30, 120, 130),
+        Struct | Enum | TypeAlias | Trait => egui::Color32::from_rgb(40, 130, 90),
+        Func => egui::Color32::from_rgb(40, 90, 170),
+        Impl | Macro => egui::Color32::from_rgb(110, 60, 130),
+        _ => egui::Color32::from_rgb(90, 90, 90),
     }
 }
 
@@ -720,12 +834,22 @@ impl eframe::App for App {
         }
 
         egui::Panel::left("functions").resizable(true).default_size(240.0).show(ui, |ui| {
+            if ui
+                .selectable_label(self.show_file, egui::RichText::new("▣ File overview").strong())
+                .on_hover_text("Every item in the file as a card: use, const, mod, structs, enums, functions...")
+                .clicked()
+            {
+                self.show_file = true;
+                self.file_view.needs_fit = true;
+            }
+            ui.add_space(4.0);
             ui.heading("Functions");
             let fns: Vec<(Vec<usize>, String)> = self.program.functions().into_iter().map(|(p, f)| (p, f.name.clone())).collect();
             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                 for (p, name) in fns {
-                    if ui.selectable_label(p == self.current, egui::RichText::new(name).monospace()).clicked() {
+                    if ui.selectable_label(!self.show_file && p == self.current, egui::RichText::new(name).monospace()).clicked() {
                         self.current = p;
+                        self.show_file = false;
                         self.load_sig();
                     }
                 }
@@ -765,15 +889,49 @@ impl eframe::App for App {
             }
             ui.weak("Parameters show up as outputs on the Entry node.");
             ui.separator();
-            let others = self.program.items.iter().filter(|i| matches!(i, Item::Raw(_) | Item::Comment(_))).count();
-            ui.weak(format!("{others} other item(s) (structs, enums, use, ...) are kept as code."));
+            let others = self.program.items.iter().filter(|i| matches!(i, Item::Raw(_) | Item::Comment(_) | Item::Header(_))).count();
+            if ui.link(format!("{others} other item(s): use, const, mod, structs... → File overview")).clicked() {
+                self.show_file = true;
+                self.file_view.needs_fit = true;
+            }
         });
 
+        self.refresh_views();
         egui::Panel::right("side").resizable(true).default_size(380.0).show(ui, |ui| {
             ui.heading("Inspector");
             let path = self.current.clone();
             let mut changed = false;
-            if let Some(f) = self.program.function_mut(&path) {
+            if self.show_file {
+                let name = self.current_name();
+                match self.file_view.inspector(ui, &mut self.program) {
+                    fileview::ItemAction::None => {}
+                    fileview::ItemAction::Changed => self.mark_changed(),
+                    action => {
+                        let sel_idx = self.file_view.selected.and_then(|s| self.file_view.cards.get(s)).map(|c| c.idx);
+                        if let Some(i) = sel_idx {
+                            let new_idx = match action {
+                                fileview::ItemAction::MoveUp if i > 0 => {
+                                    self.program.items.swap(i, i - 1);
+                                    Some(i - 1)
+                                }
+                                fileview::ItemAction::MoveDown if i + 1 < self.program.items.len() => {
+                                    self.program.items.swap(i, i + 1);
+                                    Some(i + 1)
+                                }
+                                fileview::ItemAction::Delete => {
+                                    self.program.items.remove(i);
+                                    None
+                                }
+                                _ => Some(i),
+                            };
+                            self.items_reshaped(name);
+                            self.refresh_views();
+                            self.file_view.selected = new_idx.and_then(|n| self.file_view.cards.iter().position(|c| c.idx == n));
+                        }
+                    }
+                }
+                self.handle_open();
+            } else if let Some(f) = self.program.function_mut(&path) {
                 let ed = self.editors.entry(path.clone()).or_default();
                 changed = ed.inspector(ui, f);
             }
@@ -795,6 +953,14 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.show_file {
+                self.refresh_views();
+                if let Some(t) = self.file_view.show(ui) {
+                    self.add_item(t);
+                }
+                self.handle_open();
+                return;
+            }
             let path = self.current.clone();
             let mut changed = false;
             if let Some(f) = self.program.function_mut(&path) {

@@ -3,6 +3,7 @@ mod codegen;
 mod compiler;
 mod editor;
 mod extract;
+mod fileview;
 mod graph;
 mod highlight;
 mod layout;
