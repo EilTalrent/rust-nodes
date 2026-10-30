@@ -3,6 +3,7 @@
 
 use crate::graph::*;
 use crate::layout::*;
+use std::collections::{BTreeSet, HashMap};
 use eframe::egui::{
     self, epaint::CubicBezierShape, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Shape, Stroke,
     StrokeKind, Vec2,
@@ -46,22 +47,38 @@ struct AddMenu {
 pub struct Editor {
     pub pan: Vec2,
     pub zoom: f32,
+    /// The node shown in the inspector.
     pub selected: Option<NodeId>,
+    /// Everything selected (includes `selected`).
+    pub multi: BTreeSet<NodeId>,
     dragging_wire: Option<Pin>,
     add_menu: Option<AddMenu>,
+    /// Box selection in progress: start point (screen).
+    box_start: Option<Pos2>,
     pub needs_fit: bool,
-    /// Containers we've opened, outermost first. Empty = function top level.
+    /// Containers / groups we've opened, outermost first. Empty = function top level.
     pub view: Vec<(NodeId, usize)>,
 }
 
 impl Default for Editor {
     fn default() -> Self {
-        Editor { pan: Vec2::new(40.0, 60.0), zoom: 1.0, selected: None, dragging_wire: None, add_menu: None, needs_fit: true, view: vec![] }
+        Editor {
+            pan: Vec2::new(40.0, 60.0),
+            zoom: 1.0,
+            selected: None,
+            multi: BTreeSet::new(),
+            dragging_wire: None,
+            add_menu: None,
+            box_start: None,
+            needs_fit: true,
+            view: vec![],
+        }
     }
 }
 
 const EXEC_COLOR: Color32 = Color32::from_rgb(235, 235, 235);
 const DATA_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
+const SELECT_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
 fn header_color(c: Category) -> Color32 {
     match c {
@@ -73,15 +90,67 @@ fn header_color(c: Category) -> Color32 {
         Category::Call => Color32::from_rgb(120, 60, 150),
         Category::Raw => Color32::from_rgb(70, 70, 70),
         Category::Template => Color32::from_rgb(30, 110, 120),
+        Category::Group => Color32::from_rgb(150, 70, 120),
     }
 }
 
+/// A wire, by index into `f.exec` or `f.data`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeRef {
+    Exec(usize),
+    Data(usize),
+}
+
+/// Wires that cross a group's border, shown as pins on the collapsed group node.
+#[derive(Default)]
+struct GroupPins {
+    ins: Vec<EdgeRef>,
+    outs: Vec<EdgeRef>,
+}
+
+const GROUP_W: f32 = 210.0;
+
+fn group_size(gp: &GroupPins) -> [f32; 2] {
+    let rows = gp.ins.len().max(gp.outs.len()).max(1);
+    [GROUP_W, HEADER + rows as f32 * ROW + ROW + 8.0]
+}
+
 impl Editor {
+    fn select_only(&mut self, id: NodeId) {
+        self.selected = Some(id);
+        self.multi = BTreeSet::from([id]);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.multi.clear();
+    }
+
+    fn go_to_view(&mut self, v: Vec<(NodeId, usize)>) {
+        self.view = v;
+        self.clear_selection();
+        self.add_menu = None;
+        self.needs_fit = true;
+    }
+
+    /// Group the selected nodes. Returns true if a group was made.
+    pub fn collapse_selection(&mut self, f: &mut FnGraph) -> bool {
+        let ids: Vec<NodeId> = self.multi.iter().copied().collect();
+        let n = f.nodes.values().filter(|n| matches!(n.kind, NodeKind::Group { .. })).count() + 1;
+        if let Some(g) = f.collapse(&ids, &format!("Group {n}")) {
+            self.select_only(g);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Draw the canvas for one function. Returns true if the graph changed.
     pub fn show(&mut self, ui: &mut egui::Ui, f: &mut FnGraph, salt: &str) -> bool {
         let mut changed = false;
-        // ---- breadcrumb: where we are inside nested containers ----
+        // ---- breadcrumb: where we are inside nested containers / groups ----
         self.view.retain(|(n, _)| f.nodes.contains_key(n));
+        self.multi.retain(|n| f.nodes.contains_key(n));
         if !self.view.is_empty() {
             let mut go_to: Option<usize> = None;
             ui.horizontal(|ui| {
@@ -91,7 +160,11 @@ impl Editor {
                 }
                 for (depth, (n, hole)) in self.view.iter().enumerate() {
                     ui.label("›");
-                    let label = format!("{} {}", container_label(&f.nodes[n].kind), hole_label(*hole));
+                    let k = &f.nodes[n].kind;
+                    let label = match k {
+                        NodeKind::Group { name } => format!("▣ {name}"),
+                        _ => format!("{} {}", container_label(k), hole_label(*hole)),
+                    };
                     let last = depth + 1 == self.view.len();
                     if ui.add_enabled(!last, egui::Button::new(label)).clicked() {
                         go_to = Some(depth + 1);
@@ -99,27 +172,30 @@ impl Editor {
                 }
             });
             if let Some(d) = go_to {
-                self.view.truncate(d);
-                self.selected = None;
-                self.needs_fit = true;
+                let v = self.view[..d].to_vec();
+                self.go_to_view(v);
             }
         }
         let scope: Scope = self.view.last().copied();
-        let in_view = |f: &FnGraph, id: NodeId| f.nodes.get(&id).is_some_and(|n| n.scope == scope);
         let mut enter: Option<(NodeId, usize)> = None;
 
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         let base_id = ui.scope_id().with(("rust-nodes-canvas", salt));
+        let mods = ui.input(|i| i.modifiers);
+        let additive = mods.shift || mods.command || mods.ctrl;
 
         if self.needs_fit {
             self.fit(f, rect, scope);
             self.needs_fit = false;
         }
 
-        // ---- pan & zoom ----
-        if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Primary) {
+        // ---- pan, zoom, box select ----
+        if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
             self.pan += resp.drag_delta() / self.zoom;
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.box_start = resp.interact_pointer_pos();
         }
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta().y);
@@ -135,7 +211,9 @@ impl Editor {
             }
         }
         if resp.clicked() {
-            self.selected = None;
+            if !additive {
+                self.clear_selection();
+            }
             self.add_menu = None;
         }
         if resp.secondary_clicked() {
@@ -162,99 +240,239 @@ impl Editor {
             }
         }
         let painter = painter.with_clip_rect(rect);
+        let z = self.zoom;
 
-        // ---- wires ----
-        for e in &f.data {
-            if !in_view(f, e.from) || !in_view(f, e.to) {
-                continue;
-            }
-            if let (Some(a), Some(b)) = (f.nodes.get(&e.from), f.nodes.get(&e.to)) {
-                let p0 = self.to_screen(rect, data_out_pos(a, e.from_pin, &f.params));
-                let p1 = self.to_screen(rect, data_in_pos(b, e.to_pin));
-                self.wire(&painter, p0, p1, DATA_COLOR, 2.0);
+        // ---- what's visible, and which wires cross into collapsed groups ----
+        let ids: Vec<NodeId> = f.nodes.iter().filter(|(_, n)| n.scope == scope).map(|(id, _)| *id).collect();
+        let rep = |id: NodeId| f.rep(id, scope);
+        let mut groups: HashMap<NodeId, GroupPins> = HashMap::new();
+        for id in &ids {
+            if f.is_group(*id) {
+                groups.insert(*id, GroupPins::default());
             }
         }
-        for e in &f.exec {
-            if !in_view(f, e.from) || !in_view(f, e.to) {
+        let edges: Vec<(EdgeRef, NodeId, NodeId)> = f
+            .exec
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (EdgeRef::Exec(i), e.from, e.to))
+            .chain(f.data.iter().enumerate().map(|(i, e)| (EdgeRef::Data(i), e.from, e.to)))
+            .collect();
+        for (er, from, to) in &edges {
+            let (a, b) = (rep(*from), rep(*to));
+            if a == b {
                 continue;
             }
-            if let (Some(a), Some(b)) = (f.nodes.get(&e.from), f.nodes.get(&e.to)) {
-                let p0 = self.to_screen(rect, exec_out_pos(a, e.from_pin, &f.params));
-                let p1 = self.to_screen(rect, exec_in_pos(b));
-                self.wire(&painter, p0, p1, EXEC_COLOR, 3.0);
+            if let Some(g) = b.filter(|g| groups.contains_key(g) && *g != *to) {
+                groups.get_mut(&g).unwrap().ins.push(*er);
+            }
+            if let Some(g) = a.filter(|g| groups.contains_key(g) && *g != *from) {
+                groups.get_mut(&g).unwrap().outs.push(*er);
+            }
+        }
+        let group_pin = |g: NodeId, er: EdgeRef, out: bool| -> Option<[f32; 2]> {
+            let gp = groups.get(&g)?;
+            let list = if out { &gp.outs } else { &gp.ins };
+            let i = list.iter().position(|x| *x == er)?;
+            let n = &f.nodes[&g];
+            let x = if out { n.pos[0] + GROUP_W } else { n.pos[0] };
+            Some([x, n.pos[1] + HEADER + ROW * 0.5 + i as f32 * ROW])
+        };
+        let size_of = |id: NodeId| -> [f32; 2] {
+            match groups.get(&id) {
+                Some(gp) => group_size(gp),
+                None => node_size(&f.nodes[&id].kind, &f.params),
+            }
+        };
+
+        // ---- wires ----
+        for (er, from, to) in &edges {
+            let (Some(a), Some(b)) = (rep(*from), rep(*to)) else { continue };
+            if a == b {
+                continue;
+            }
+            let (p0, p1, color, width) = match *er {
+                EdgeRef::Data(i) => {
+                    let e = f.data[i];
+                    let p0 = if a == e.from { Some(data_out_pos(&f.nodes[&a], e.from_pin, &f.params)) } else { group_pin(a, *er, true) };
+                    let p1 = if b == e.to { Some(data_in_pos(&f.nodes[&b], e.to_pin)) } else { group_pin(b, *er, false) };
+                    (p0, p1, DATA_COLOR, 2.0)
+                }
+                EdgeRef::Exec(i) => {
+                    let e = f.exec[i];
+                    let p0 = if a == e.from { Some(exec_out_pos(&f.nodes[&a], e.from_pin, &f.params)) } else { group_pin(a, *er, true) };
+                    let p1 = if b == e.to { Some(exec_in_pos(&f.nodes[&b])) } else { group_pin(b, *er, false) };
+                    (p0, p1, EXEC_COLOR, 3.0)
+                }
+            };
+            if let (Some(p0), Some(p1)) = (p0, p1) {
+                self.wire(&painter, self.to_screen(rect, p0), self.to_screen(rect, p1), color, width);
             }
         }
 
         // ---- nodes ----
-        let z = self.zoom;
-        let ids: Vec<NodeId> = f.nodes.iter().filter(|(_, n)| n.scope == scope).map(|(id, _)| *id).collect();
-        let mut to_delete = None;
+        let mut to_delete: Vec<NodeId> = vec![];
         let mut to_duplicate = None;
+        let mut to_ungroup = None;
+        let mut collapse = false;
         let mut pins: Vec<(Pin, Pos2)> = vec![];
-        let mut pills: Vec<(Pos2, String)> = vec![];
-        for id in ids {
+        // labels for wires to/from outside this view: (pin position, text, on the left side?)
+        let mut pills: Vec<(Pos2, String, bool)> = vec![];
+        let mut node_rects: Vec<(NodeId, Rect)> = vec![];
+        let mut drag_delta = Vec2::ZERO;
+        for &id in &ids {
             let node = &f.nodes[&id];
-            let [w, h] = node_size(&node.kind, &f.params);
+            let [w, h] = size_of(id);
             let r = Rect::from_min_size(self.to_screen(rect, node.pos), Vec2::new(w, h) * z);
-            if !r.intersects(rect.expand(400.0)) {
-                // still register pins so wires can be dropped near the edge
-            }
+            node_rects.push((id, r));
             let nresp = ui.interact(r, base_id.with(("node", id)), Sense::click_and_drag());
-            if nresp.dragged_by(egui::PointerButton::Primary) {
-                let d = nresp.drag_delta() / z;
-                let n = f.nodes.get_mut(&id).unwrap();
-                n.pos[0] += d.x;
-                n.pos[1] += d.y;
-                changed = true;
+            if nresp.drag_started_by(egui::PointerButton::Primary) && !self.multi.contains(&id) {
+                if additive {
+                    self.multi.insert(id);
+                    self.selected = Some(id);
+                } else {
+                    self.select_only(id);
+                }
             }
-            if nresp.clicked() || nresp.drag_started() {
-                self.selected = Some(id);
+            if nresp.dragged_by(egui::PointerButton::Primary) {
+                drag_delta = nresp.drag_delta() / z; // moves every selected node
+            }
+            if nresp.clicked() {
+                if additive {
+                    if !self.multi.remove(&id) {
+                        self.multi.insert(id);
+                    }
+                    self.selected = Some(id);
+                } else {
+                    self.select_only(id);
+                }
             }
             if nresp.double_clicked() {
-                if let Some(&hole) = f.nodes[&id].kind.block_holes().first() {
+                if f.is_group(id) {
+                    enter = Some((id, 0));
+                } else if let Some(&hole) = f.nodes[&id].kind.block_holes().first() {
                     enter = Some((id, hole));
                 }
             }
-            let fixed = id == f.entry || matches!(f.nodes[&id].kind, NodeKind::BlockEntry { .. });
+            let fixed = f.is_fixed(id);
+            let is_group = f.is_group(id);
+            let sel_count = if self.multi.contains(&id) { self.multi.len() } else { 1 };
             nresp.context_menu(|ui| {
-                if !fixed && ui.button("Delete").clicked() {
-                    to_delete = Some(id);
-                    ui.close();
+                if is_group {
+                    if ui.button("Open group").clicked() {
+                        enter = Some((id, 0));
+                        ui.close();
+                    }
+                    if ui.button("Ungroup").clicked() {
+                        to_ungroup = Some(id);
+                        ui.close();
+                    }
                 }
-                if !fixed && ui.button("Duplicate").clicked() {
-                    to_duplicate = Some(id);
-                    ui.close();
+                if !fixed {
+                    let label = if sel_count > 1 { format!("Collapse {sel_count} nodes into a group") } else { "Collapse into a group".into() };
+                    if ui.button(label).on_hover_text("Ctrl+G").clicked() {
+                        if !self.multi.contains(&id) {
+                            self.select_only(id);
+                        }
+                        collapse = true;
+                        ui.close();
+                    }
+                    let del = if is_group { "Delete group and its nodes".to_string() } else if sel_count > 1 { format!("Delete {sel_count} nodes") } else { "Delete".into() };
+                    if ui.button(del).clicked() {
+                        if self.multi.contains(&id) {
+                            to_delete.extend(self.multi.iter().copied());
+                        } else {
+                            to_delete.push(id);
+                        }
+                        ui.close();
+                    }
+                    if !is_group && ui.button("Duplicate").clicked() {
+                        to_duplicate = Some(id);
+                        ui.close();
+                    }
                 }
             });
 
             let node = &f.nodes[&id];
             let kind = &node.kind;
-            let sel = self.selected == Some(id);
+            let sel = self.multi.contains(&id);
             let cr = CornerRadius::same((6.0 * z).round().clamp(0.0, 255.0) as u8);
-            painter.rect_filled(r.translate(Vec2::splat(3.0 * z)), cr, Color32::from_black_alpha(90));
+            if is_group {
+                // stacked-card look for collapsed groups
+                for k in [2.0, 1.0] {
+                    let back = r.translate(Vec2::new(4.0, 4.0) * k * z);
+                    painter.rect_filled(back, cr, Color32::from_rgb(40, 34, 44));
+                    painter.rect_stroke(back, cr, Stroke::new(1.0, Color32::from_rgb(90, 60, 85)), StrokeKind::Outside);
+                }
+            } else {
+                painter.rect_filled(r.translate(Vec2::splat(3.0 * z)), cr, Color32::from_black_alpha(90));
+            }
             painter.rect_filled(r, cr, Color32::from_rgb(48, 48, 54));
             let header = Rect::from_min_size(r.min, Vec2::new(r.width(), HEADER * z));
-            painter.rect_filled(
-                header,
-                CornerRadius { nw: cr.nw, ne: cr.ne, sw: 0, se: 0 },
-                header_color(kind.category()),
-            );
-            let border = if sel { Stroke::new(2.0, Color32::from_rgb(255, 200, 60)) } else { Stroke::new(1.0, Color32::from_gray(20)) };
+            painter.rect_filled(header, CornerRadius { nw: cr.nw, ne: cr.ne, sw: 0, se: 0 }, header_color(kind.category()));
+            let border = if sel { Stroke::new(2.0, SELECT_COLOR) } else { Stroke::new(1.0, Color32::from_gray(20)) };
             painter.rect_stroke(r, cr, border, StrokeKind::Outside);
-            painter.text(
-                header.left_center() + Vec2::new(8.0 * z, 0.0),
-                Align2::LEFT_CENTER,
-                kind.title(),
-                FontId::proportional(13.0 * z),
-                Color32::WHITE,
-            );
+            let title = if is_group { format!("▣ {}", kind.title()) } else { kind.title() };
+            painter.text(header.left_center() + Vec2::new(8.0 * z, 0.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0 * z), Color32::WHITE);
 
             let label_font = FontId::proportional(11.5 * z);
             let label_color = Color32::from_gray(200);
+
+            if let Some(gp) = groups.get(&id) {
+                // proxy pins for wires crossing the group's border (rewire inside the group)
+                for er in gp.ins.iter() {
+                    let p = self.to_screen(rect, group_pin(id, *er, false).unwrap());
+                    let text = match *er {
+                        EdgeRef::Exec(_) => "▶ in".to_string(),
+                        EdgeRef::Data(di) => {
+                            let e = f.data[di];
+                            crate::codegen::expr_preview(f, e.from, e.from_pin)
+                        }
+                    };
+                    match er {
+                        EdgeRef::Exec(_) => self.exec_pin(&painter, p, true),
+                        EdgeRef::Data(_) => self.data_pin(&painter, p, true),
+                    }
+                    painter.text(p + Vec2::new(10.0 * z, 0.0), Align2::LEFT_CENTER, text, label_font.clone(), label_color);
+                }
+                for er in gp.outs.iter() {
+                    let p = self.to_screen(rect, group_pin(id, *er, true).unwrap());
+                    let text = match *er {
+                        EdgeRef::Exec(_) => "out ▶".to_string(),
+                        EdgeRef::Data(di) => {
+                            let e = f.data[di];
+                            crate::codegen::expr_preview(f, e.from, e.from_pin)
+                        }
+                    };
+                    match er {
+                        EdgeRef::Exec(_) => self.exec_pin(&painter, p, true),
+                        EdgeRef::Data(_) => self.data_pin(&painter, p, true),
+                    }
+                    painter.text(p - Vec2::new(10.0 * z, 0.0), Align2::RIGHT_CENTER, text, label_font.clone(), label_color);
+                }
+                // "open" row
+                let top = r.bottom() - (ROW + 4.0) * z;
+                let row = Rect::from_min_size(Pos2::new(r.left() + 4.0 * z, top), Vec2::new(r.width() - 8.0 * z, (ROW - 3.0) * z));
+                let rr = ui.interact(row, base_id.with(("open", id, usize::MAX)), Sense::click());
+                let fill = if rr.hovered() { Color32::from_rgb(105, 55, 95) } else { Color32::from_rgb(80, 45, 75) };
+                painter.rect_filled(row, CornerRadius::same((4.0 * z) as u8), fill);
+                let count = f.members(id).len();
+                let label = format!("▶ open group · {count} node{}", if count == 1 { "" } else { "s" });
+                painter.text(row.left_center() + Vec2::new(6.0 * z, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(11.5 * z), Color32::WHITE);
+                if rr.clicked() {
+                    enter = Some((id, 0));
+                }
+                continue;
+            }
+
             // left pins
             if kind.has_exec_in() {
                 let p = self.to_screen(rect, exec_in_pos(node));
-                self.exec_pin(&painter, p, f.exec.iter().any(|e| e.to == id));
+                let incoming: Vec<NodeId> = f.exec.iter().filter(|e| e.to == id).map(|e| e.from).collect();
+                self.exec_pin(&painter, p, !incoming.is_empty());
+                if incoming.iter().any(|src| rep(*src).is_none()) {
+                    pills.push((p, "from outside".into(), true));
+                }
                 pins.push((Pin::ExecIn(id), p));
             }
             for (i, name) in kind.data_ins().iter().enumerate() {
@@ -262,10 +480,10 @@ impl Editor {
                 let source = f.data_source(id, i);
                 self.data_pin(&painter, p, source.is_some());
                 painter.text(p + Vec2::new(10.0 * z, 0.0), Align2::LEFT_CENTER, name, label_font.clone(), label_color);
-                // a value coming from outside this container: label it with where it comes from
+                // a value coming from outside this view: label it with where it comes from
                 if let Some((src, sp)) = source {
-                    if !in_view(f, src) {
-                        pills.push((p, crate::codegen::expr_preview(f, src, sp)));
+                    if rep(src).is_none() {
+                        pills.push((p, crate::codegen::expr_preview(f, src, sp), true));
                     }
                 }
                 pins.push((Pin::DataIn(id, i), p));
@@ -273,15 +491,22 @@ impl Editor {
             // right pins
             for (i, name) in kind.exec_outs().iter().enumerate() {
                 let p = self.to_screen(rect, exec_out_pos(node, i, &f.params));
-                self.exec_pin(&painter, p, f.exec_target(id, i).is_some());
+                let target = f.exec_target(id, i);
+                self.exec_pin(&painter, p, target.is_some());
                 painter.text(p - Vec2::new(10.0 * z, 0.0), Align2::RIGHT_CENTER, *name, label_font.clone(), label_color);
+                if target.is_some_and(|t| rep(t).is_none()) {
+                    pills.push((p, "continues outside".into(), false));
+                }
                 pins.push((Pin::ExecOut(id, i), p));
             }
             for (i, name) in kind.data_outs(&f.params).iter().enumerate() {
                 let p = self.to_screen(rect, data_out_pos(node, i, &f.params));
-                let connected = f.data.iter().any(|e| e.from == id && e.from_pin == i);
-                self.data_pin(&painter, p, connected);
+                let users: Vec<NodeId> = f.data.iter().filter(|e| e.from == id && e.from_pin == i).map(|e| e.to).collect();
+                self.data_pin(&painter, p, !users.is_empty());
                 painter.text(p - Vec2::new(10.0 * z, 0.0), Align2::RIGHT_CENTER, name, label_font.clone(), label_color);
+                if !users.is_empty() && users.iter().all(|u| rep(*u).is_none()) && !matches!(kind, NodeKind::Entry | NodeKind::BlockEntry { .. }) {
+                    pills.push((p, "used outside".into(), false));
+                }
                 pins.push((Pin::DataOut(id, i), p));
             }
             // code body (raw nodes and templates)
@@ -290,13 +515,7 @@ impl Editor {
                 let lines: Vec<&str> = code.lines().collect();
                 for (li, line) in lines.iter().take(MAX_BODY_LINES).enumerate() {
                     let line = if li + 1 == MAX_BODY_LINES && lines.len() > MAX_BODY_LINES { "…" } else { line };
-                    painter.text(
-                        Pos2::new(r.left() + 8.0 * z, y),
-                        Align2::LEFT_TOP,
-                        line,
-                        FontId::monospace(11.5 * z),
-                        Color32::from_rgb(220, 220, 170),
-                    );
+                    painter.text(Pos2::new(r.left() + 8.0 * z, y), Align2::LEFT_TOP, line, FontId::monospace(11.5 * z), Color32::from_rgb(220, 220, 170));
                     y += LINE * z;
                 }
             }
@@ -321,15 +540,54 @@ impl Editor {
             }
         }
 
-        // labels for values that come from outside this container (drawn on top)
-        for (p, text) in pills {
-            let galley = painter.layout_no_wrap(format!("{text} ›"), FontId::monospace(11.0 * z), Color32::from_rgb(170, 240, 210));
+        // move the whole selection together
+        if drag_delta != Vec2::ZERO {
+            for id in &self.multi {
+                if let Some(n) = f.nodes.get_mut(id) {
+                    n.pos[0] += drag_delta.x;
+                    n.pos[1] += drag_delta.y;
+                }
+            }
+            changed = true;
+        }
+
+        // labels for wires to/from outside this view (drawn on top)
+        for (p, text, left) in pills {
+            let galley = painter.layout_no_wrap(if left { format!("{text} ›") } else { format!("› {text}") }, FontId::monospace(11.0 * z), Color32::from_rgb(170, 240, 210));
             let size = galley.size() + Vec2::new(10.0, 4.0) * z;
-            let pill = Rect::from_min_size(p - Vec2::new(size.x + 8.0 * z, size.y * 0.5), size);
+            let pill = if left {
+                Rect::from_min_size(p - Vec2::new(size.x + 8.0 * z, size.y * 0.5), size)
+            } else {
+                Rect::from_min_size(p + Vec2::new(8.0 * z, -size.y * 0.5), size)
+            };
             painter.rect_filled(pill, CornerRadius::same((4.0 * z) as u8), Color32::from_rgb(28, 62, 52));
             painter.rect_stroke(pill, CornerRadius::same((4.0 * z) as u8), Stroke::new(1.0, DATA_COLOR), StrokeKind::Inside);
-            painter.line_segment([pill.right_center(), p], Stroke::new(1.5, DATA_COLOR));
+            let anchor = if left { pill.right_center() } else { pill.left_center() };
+            painter.line_segment([anchor, p], Stroke::new(1.5, DATA_COLOR));
             painter.galley(pill.min + Vec2::new(5.0, 2.0) * z, galley, Color32::WHITE);
+        }
+
+        // ---- box selection ----
+        if let Some(start) = self.box_start {
+            if let Some(now) = ui.input(|i| i.pointer.interact_pos()) {
+                let sel_rect = Rect::from_two_pos(start, now);
+                painter.rect_filled(sel_rect, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(255, 200, 60, 25));
+                painter.rect_stroke(sel_rect, CornerRadius::ZERO, Stroke::new(1.0, SELECT_COLOR), StrokeKind::Inside);
+                if ui.input(|i| i.pointer.any_released()) {
+                    if !additive {
+                        self.clear_selection();
+                    }
+                    for (id, r) in &node_rects {
+                        if sel_rect.intersects(*r) {
+                            self.multi.insert(*id);
+                        }
+                    }
+                    self.selected = self.multi.iter().next().copied();
+                    self.box_start = None;
+                }
+            } else {
+                self.box_start = None;
+            }
         }
 
         // ---- pin interaction (after nodes, so pins win over node bodies) ----
@@ -383,35 +641,55 @@ impl Editor {
         }
 
         if let Some(e) = enter {
-            self.view.push(e);
-            self.selected = None;
-            self.add_menu = None;
-            self.needs_fit = true;
-        }
-        if !self.view.is_empty() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.add_menu.is_none() {
-            self.view.pop();
-            self.selected = None;
-            self.needs_fit = true;
+            let mut v = self.view.clone();
+            v.push(e);
+            self.go_to_view(v);
         }
 
         // ---- keyboard ----
-        if !ui.ctx().egui_wants_keyboard_input() && resp.ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-            if let Some(sel) = self.selected {
-                to_delete = Some(sel);
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        if !typing {
+            if !self.view.is_empty() && self.add_menu.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                let mut v = self.view.clone();
+                v.pop();
+                self.go_to_view(v);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+                to_delete.extend(self.multi.iter().copied());
+            }
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
+                collapse = true;
+            }
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                self.multi = ids.iter().copied().collect();
+                self.selected = self.multi.iter().next().copied();
             }
         }
-        if let Some(id) = to_delete {
-            if id != f.entry {
-                f.remove(id);
-                self.selected = None;
-                changed = true;
+        if collapse && self.collapse_selection(f) {
+            changed = true;
+        }
+        if let Some(g) = to_ungroup {
+            let members = f.members(g);
+            f.ungroup(g);
+            self.multi = members.into_iter().collect();
+            self.selected = self.multi.iter().next().copied();
+            changed = true;
+        }
+        if !to_delete.is_empty() {
+            for id in to_delete {
+                if !f.is_fixed(id) {
+                    f.remove(id);
+                }
             }
+            self.clear_selection();
+            changed = true;
         }
         if let Some(id) = to_duplicate {
             let mut n = f.nodes[&id].clone();
             n.pos[0] += 30.0;
             n.pos[1] += 30.0;
-            self.selected = Some(f.add(n.kind, n.pos));
+            let new = f.add_in(n.kind, n.pos, n.scope);
+            self.select_only(new);
             changed = true;
         }
 
@@ -421,7 +699,7 @@ impl Editor {
         painter.text(
             rect.left_bottom() + Vec2::new(10.0, -10.0),
             Align2::LEFT_BOTTOM,
-            "Right-click: add node   Drag pin→pin: connect   Drag wire to empty space: add & connect   Del: delete   Scroll: zoom   Drag background: pan",
+            "Right-click: add node · Drag pin→pin: connect · Drag on empty space: box select · Right/middle-drag: pan · Scroll: zoom · Shift/Ctrl-click: multi-select · Ctrl+G: group · Del: delete",
             FontId::proportional(12.0),
             Color32::from_gray(130),
         );
@@ -485,7 +763,7 @@ impl Editor {
                     connect(f, p, to);
                 }
             }
-            self.selected = Some(id);
+            self.select_only(id);
             close = true;
             changed = true;
         }
@@ -543,15 +821,38 @@ impl Editor {
         if min[0] > max[0] {
             return;
         }
-        let size = Vec2::new(max[0] - min[0] + 80.0, max[1] - min[1] + 80.0);
+        // extra room on the sides for "from outside" / "used outside" labels
+        let margin = if scope.is_some() { 130.0 } else { 40.0 };
+        let size = Vec2::new(max[0] - min[0] + margin * 2.0, max[1] - min[1] + 80.0);
         self.zoom = (rect.width() / size.x).min(rect.height() / size.y).clamp(0.6, 1.0);
-        self.pan = Vec2::new(-min[0] + 40.0, -min[1] + 40.0);
+        self.pan = Vec2::new(-min[0] + margin, -min[1] + 40.0);
     }
 
     /// Property editor for the selected node. Returns true if something changed.
     pub fn inspector(&mut self, ui: &mut egui::Ui, f: &mut FnGraph) -> bool {
+        if self.multi.len() > 1 {
+            ui.strong(format!("{} nodes selected", self.multi.len()));
+            ui.add_space(4.0);
+            let mut c = false;
+            ui.horizontal(|ui| {
+                if ui.button("▣ Collapse into a group").on_hover_text("Ctrl+G").clicked() {
+                    c |= self.collapse_selection(f);
+                }
+                if ui.button("Delete").clicked() {
+                    for id in std::mem::take(&mut self.multi) {
+                        if !f.is_fixed(id) {
+                            f.remove(id);
+                        }
+                    }
+                    self.selected = None;
+                    c = true;
+                }
+            });
+            ui.weak("Groups only tidy up the graph: the generated Rust stays exactly the same.");
+            return c;
+        }
         let Some(id) = self.selected else {
-            ui.weak("Select a node to edit it.");
+            ui.weak("Select a node to edit it. Drag on empty space to select several.");
             return false;
         };
         let Some(node) = f.nodes.get_mut(&id) else {
@@ -576,7 +877,20 @@ impl Editor {
             .inner
         };
         use NodeKind::*;
+        let mut ungroup = false;
         match &mut node.kind {
+            Group { name } => {
+                c |= mono(ui, "name", name);
+                ui.horizontal(|ui| {
+                    if ui.button("▶ Open").clicked() {
+                        open = Some((id, 0));
+                    }
+                    if ui.button("Ungroup").clicked() {
+                        ungroup = true;
+                    }
+                });
+                ui.weak("A group only tidies up the graph: the generated Rust is the same with or without it.");
+            }
             Entry => {
                 ui.weak("Function start. Edit the signature in the left panel.");
             }
@@ -649,10 +963,17 @@ impl Editor {
         if c {
             f.prune_edges();
         }
+        if ungroup {
+            let members = f.members(id);
+            f.ungroup(id);
+            self.multi = members.into_iter().collect();
+            self.selected = self.multi.iter().next().copied();
+            c = true;
+        }
         if let Some(o) = open {
-            self.view.push(o);
-            self.selected = None;
-            self.needs_fit = true;
+            let mut v = self.view.clone();
+            v.push(o);
+            self.go_to_view(v);
         }
         c
     }

@@ -151,6 +151,9 @@ pub enum NodeKind {
     RawExpr { code: String },
     /// Expression version of [`NodeKind::TemplateStmt`] (closures, match used as a value, ...).
     Template { code: String, holes: Vec<Hole> },
+    /// A purely visual group ("collapsed graph"). Its members have `scope = Some((group, 0))`.
+    /// It doesn't change the generated code at all.
+    Group { name: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,6 +166,7 @@ pub enum Category {
     Call,
     Raw,
     Template,
+    Group,
 }
 
 impl NodeKind {
@@ -301,6 +305,7 @@ impl NodeKind {
             BlockEntry { binders } if binders.is_empty() => "Block start".into(),
             BlockEntry { binders } => format!("Block start ({})", binders.join(", ")),
             BlockValue => "Result".into(),
+            Group { name } => name.clone(),
         }
     }
 
@@ -310,6 +315,7 @@ impl NodeKind {
             Entry | BlockEntry { .. } => Category::Entry,
             BlockValue => Category::Flow,
             Template { .. } | TemplateStmt { .. } => Category::Template,
+            Group { .. } => Category::Group,
             If | While | Loop | For { .. } | Break | Continue | Return => Category::Flow,
             Let { .. } | Assign { .. } | Eval => Category::Statement,
             Literal { .. } | Var { .. } => Category::Value,
@@ -475,6 +481,70 @@ impl FnGraph {
             (Some(f), Some(t)) => e.from_pin < f.kind.exec_outs().len() && t.kind.has_exec_in(),
             _ => false,
         });
+    }
+}
+
+impl FnGraph {
+    pub fn is_group(&self, id: NodeId) -> bool {
+        matches!(self.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::Group { .. }))
+    }
+
+    /// Nodes that can't be grouped or deleted: the function's Entry and container Block starts.
+    pub fn is_fixed(&self, id: NodeId) -> bool {
+        id == self.entry || matches!(self.nodes.get(&id).map(|n| &n.kind), Some(NodeKind::BlockEntry { .. }))
+    }
+
+    /// Put nodes into a new visual group. They must all be in the same view.
+    /// The generated Rust doesn't change: exec and data wires stay exactly as they are.
+    pub fn collapse(&mut self, ids: &[NodeId], name: &str) -> Option<NodeId> {
+        let ids: Vec<NodeId> = ids.iter().copied().filter(|id| self.nodes.contains_key(id) && !self.is_fixed(*id)).collect();
+        let scope = self.nodes[ids.first()?].scope;
+        if ids.iter().any(|id| self.nodes[id].scope != scope) {
+            return None;
+        }
+        let x = ids.iter().map(|id| self.nodes[id].pos[0]).fold(f32::MAX, f32::min);
+        let y = ids.iter().map(|id| self.nodes[id].pos[1]).fold(f32::MAX, f32::min);
+        let g = self.add_in(NodeKind::Group { name: name.to_string() }, [x, y], scope);
+        for id in ids {
+            self.nodes.get_mut(&id).unwrap().scope = Some((g, 0));
+        }
+        Some(g)
+    }
+
+    /// Dissolve a group: its members go back to the group's own view.
+    pub fn ungroup(&mut self, g: NodeId) {
+        if !self.is_group(g) {
+            return;
+        }
+        let outer = self.nodes[&g].scope;
+        for n in self.nodes.values_mut() {
+            if n.scope == Some((g, 0)) {
+                n.scope = outer;
+            }
+        }
+        self.nodes.remove(&g);
+    }
+
+    /// What represents node `id` when looking at `view`: the node itself if it's directly in
+    /// the view, the (outermost) group that contains it, or None if it's elsewhere.
+    pub fn rep(&self, id: NodeId, view: Scope) -> Option<NodeId> {
+        let mut n = id;
+        for _ in 0..64 {
+            let node = self.nodes.get(&n)?;
+            if node.scope == view {
+                return Some(n);
+            }
+            match node.scope {
+                Some((owner, _)) if self.is_group(owner) => n = owner,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Direct members of a group.
+    pub fn members(&self, g: NodeId) -> Vec<NodeId> {
+        self.nodes.iter().filter(|(_, n)| n.scope == Some((g, 0))).map(|(id, _)| *id).collect()
     }
 }
 

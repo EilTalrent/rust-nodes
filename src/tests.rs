@@ -117,3 +117,89 @@ fn deleting_a_container_deletes_its_inside() {
     f.remove(mid);
     assert!(f.nodes.values().all(|n| n.scope.is_none()), "inner nodes left behind");
 }
+
+fn main_of(p: &mut Program) -> &mut FnGraph {
+    let path = p.functions().into_iter().find(|(_, f)| f.name == "main").unwrap().0;
+    p.function_mut(&path).unwrap()
+}
+
+/// Top-level exec nodes after Entry, in order.
+fn top_chain(f: &FnGraph) -> Vec<NodeId> {
+    let mut out = vec![];
+    let mut cur = f.exec_target(f.entry, 0);
+    while let Some(id) = cur {
+        out.push(id);
+        cur = f.nodes[&id].kind.next_pin().and_then(|p| f.exec_target(id, p));
+    }
+    out
+}
+
+#[test]
+fn grouping_does_not_change_code() {
+    let src = std::fs::read_to_string("examples/samples/containers.rs").unwrap();
+    let mut p = parse_program(&src).unwrap();
+    let before = generate(&p).code;
+    let f = main_of(&mut p);
+    let chain = top_chain(f);
+    // group statements 2..6 together with the value nodes feeding them
+    let mut ids: Vec<NodeId> = chain[2..6].to_vec();
+    for id in chain[2..6].iter() {
+        for pin in 0..f.nodes[id].kind.data_ins().len() {
+            if let Some((src, _)) = f.data_source(*id, pin) {
+                if f.nodes[&src].scope.is_none() && !f.nodes[&src].kind.is_exec() {
+                    ids.push(src);
+                }
+            }
+        }
+    }
+    let g = f.collapse(&ids, "setup").expect("grouped");
+    let inner = f.collapse(&chain[3..5], "inner").expect("nested group");
+    assert_eq!(f.nodes[&inner].scope, Some((g, 0)));
+    assert_eq!(f.rep(chain[3], None), Some(g));
+    assert_eq!(f.rep(chain[3], Some((g, 0))), Some(inner));
+    assert_eq!(generate(&p).code, before, "grouping changed the generated code");
+
+    let f = main_of(&mut p);
+    f.ungroup(inner);
+    f.ungroup(g);
+    assert!(f.nodes.values().all(|n| !matches!(n.kind, NodeKind::Group { .. })));
+    assert!(chain.iter().all(|id| f.nodes[id].scope.is_none()));
+    assert_eq!(generate(&p).code, before);
+}
+
+#[test]
+fn entry_cannot_be_grouped() {
+    let mut p = parse_program("fn main() { let a = 1; println!(\"{}\", a); }").unwrap();
+    let f = main_of(&mut p);
+    let entry = f.entry;
+    assert!(f.collapse(&[entry], "x").is_none());
+}
+
+#[test]
+fn groups_survive_editing_the_file_outside() {
+    let dir = std::env::temp_dir().join(format!("rust-nodes-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {\n    let a = 1;\n    let b = a + 2;\n    println!(\"{}\", b);\n}\n").unwrap();
+    let mut p = crate::project::open(&file).unwrap().program;
+    let f = main_of(&mut p);
+    let chain = top_chain(f);
+    f.collapse(&chain[0..2], "math").unwrap();
+    crate::project::save(&file, &p).unwrap();
+
+    // edit the .rs in a "text editor": add a line at the end
+    let text = std::fs::read_to_string(&file).unwrap().replace("println!(\"{}\", b);", "println!(\"{}\", b);\n    println!(\"done\");");
+    std::fs::write(&file, text).unwrap();
+
+    let loaded = crate::project::open(&file).unwrap();
+    assert!(loaded.note.contains("re-read"), "{}", loaded.note);
+    let mut p2 = loaded.program;
+    let f2 = main_of(&mut p2);
+    let groups: Vec<NodeId> = f2.nodes.keys().copied().filter(|id| f2.is_group(*id)).collect();
+    assert_eq!(groups.len(), 1);
+    let members = f2.members(groups[0]);
+    let lets = members.iter().filter(|id| matches!(f2.nodes[id].kind, NodeKind::Let { .. })).count();
+    assert_eq!(lets, 2, "both lets should be back in the group");
+    assert!(generate(&p2).code.contains("println!(\"done\")"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

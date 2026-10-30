@@ -87,15 +87,30 @@ becomes one node, `match ⓪ { Shape::Circle { r } => ①, Shape::Rect { w, h } 
 
 This is similar to Unreal's collapsed graphs, Blender node groups and Houdini subnetworks, combined with Scratch/Blockly-style "code with slots". Templates nest freely: a closure inside a `match` arm inside a `for` is a container inside a container. The only code still kept as plain text is code with nothing inside it to split out, like `break 'outer;`.
 
+## Groups (collapse nodes)
+
+Select some nodes and press **Ctrl+G** (or **▣ Collapse into a group** in the inspector, or right-click → *Collapse into a group*) to fold them into one group node, like Unreal's collapsed graphs.
+
+* Wires that cross the group's edge become pins on the group node: `▶ in` / `out ▶` for execution and the value's name for data.
+* **▶ open group** (or double-click) shows the nodes inside. Labels like `from outside`, `used outside` and `continues outside` mark wires that leave the group.
+* Groups nest, can be renamed in the inspector, and **Ungroup** puts the nodes back.
+* **Groups are visual only: the generated Rust is exactly the same with or without them.** Wrapping nodes in a real `{ }` block would change which variables are visible afterwards, so groups never do that. They're saved in the `.nodes.json` layout file and are kept when the `.rs` is edited in a text editor and re-read.
+
+![A collapsed group](docs/group.png)
+![Inside the group](docs/group-inside.png)
+
 ## Using the editor
 
 * **Right-click** the canvas → add a node (with search)
 * **Drag from a pin to a pin** → connect
 * **Drag a wire into empty space** → the add menu opens, showing only nodes that fit, and the new node is connected for you
 * **Drag from a connected input** → pick the wire back up
-* **Drag a node header** → move it · **Delete/Backspace** → delete · right-click a node → Delete / Duplicate
+* **Drag on empty space** → box-select · **Shift/Ctrl-click** → add to or remove from the selection · **Ctrl+A** → select all
+* **Drag a node** → moves it (or the whole selection) · **Delete/Backspace** → delete · right-click a node → Delete / Duplicate / Collapse
+* **Ctrl+G** → collapse the selection into a group · **Ungroup** in the inspector or right-click menu
+* **Right- or middle-drag** → pan
 * **▶ open** rows / **double-click** a template → go into a container · breadcrumb or **Esc** → back out
-* **Scroll** → zoom · **drag the background** → pan
+* **Scroll** → zoom
 * **Inspector** (right) edits the selected node: names, operators, argument counts, raw code…
 * **Generated Rust** (right) updates live as you edit
 * **Left panel**: functions in the file, add/delete functions, edit the signature (parameters become Entry outputs)
@@ -140,7 +155,8 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 - [ ] Type info from rust-analyzer: colour pins by type, catch bad wires before compiling
 - [ ] Auto-generate nodes for every function in a crate (via rustdoc JSON) so you can search the whole ecosystem
 - [ ] Dedicated `match` / `if let` nodes with one exec pin per arm (on top of the generic templates)
-- [ ] "Collapse selection to container" and "expand container" commands
+- [x] Collapse a selection into a group / ungroup
+- [ ] Turn a group into a real Rust helper function ("extract function")
 - [ ] Undo/redo, copy/paste, comment boxes, reroute nodes
 - [ ] Keep comments by storing them on nodes
 - [ ] Other backends (C, direct LLVM via `inkwell`) using the same graph

@@ -73,12 +73,79 @@ fn carry_positions(old: &Program, new: &mut Program) {
     for p in paths {
         let f = new.function_mut(&p).unwrap();
         let Some(of) = old_fns.get(&f.name) else { continue };
+        let old_paths = node_paths(of);
         let old_by_path: HashMap<String, [f32; 2]> =
-            node_paths(of).into_iter().map(|(id, path)| (path, of.nodes[&id].pos)).collect();
-        for (id, path) in node_paths(f) {
-            if let Some(pos) = old_by_path.get(&path) {
-                f.nodes.get_mut(&id).unwrap().pos = *pos;
+            old_paths.iter().map(|(id, path)| (path.clone(), of.nodes[id].pos)).collect();
+        let new_paths = node_paths(f);
+        for (id, path) in &new_paths {
+            if let Some(pos) = old_by_path.get(path) {
+                f.nodes.get_mut(id).unwrap().pos = *pos;
             }
+        }
+        let new_by_path: HashMap<String, NodeId> = new_paths.into_iter().map(|(id, p)| (p, id)).collect();
+        carry_groups(of, f, &old_paths, &new_by_path);
+    }
+}
+
+/// Groups exist only in the layout file, so re-create them on the re-read graph,
+/// matching their members by structural path.
+pub fn carry_groups(of: &FnGraph, f: &mut FnGraph, old_paths: &HashMap<NodeId, String>, new_by_path: &HashMap<String, NodeId>) {
+    let old_groups: Vec<NodeId> = of.nodes.keys().copied().filter(|id| of.is_group(*id)).collect();
+    if old_groups.is_empty() {
+        return;
+    }
+    let mut map: HashMap<NodeId, NodeId> = HashMap::new();
+    for g in &old_groups {
+        let n = &of.nodes[g];
+        let new = f.add_in(n.kind.clone(), n.pos, None);
+        map.insert(*g, new);
+    }
+    // the old node a scope refers to, translated into the new graph
+    let map_scope = |s: Scope| -> Option<Scope> {
+        match s {
+            None => Some(None),
+            Some((owner, h)) => {
+                if let Some(g) = map.get(&owner) {
+                    Some(Some((*g, 0)))
+                } else {
+                    let id = new_by_path.get(old_paths.get(&owner)?)?;
+                    Some(Some((*id, h)))
+                }
+            }
+        }
+    };
+    for g in &old_groups {
+        let scope = map_scope(of.nodes[g].scope).unwrap_or(None);
+        f.nodes.get_mut(&map[g]).unwrap().scope = scope;
+    }
+    // the real (non-group) container a scope sits in
+    let structural = |f: &FnGraph, mut s: Scope| -> Scope {
+        for _ in 0..64 {
+            match s {
+                Some((owner, _)) if f.is_group(owner) => s = f.nodes[&owner].scope,
+                _ => break,
+            }
+        }
+        s
+    };
+    for (old_id, path) in old_paths {
+        let Some(Some((owner, _))) = of.nodes.get(old_id).map(|n| n.scope) else { continue };
+        let Some(new_g) = map.get(&owner).copied() else { continue };
+        let Some(new_id) = new_by_path.get(path).copied() else { continue };
+        let target = Some((new_g, 0));
+        // only move it if it's in the same real container the group is in
+        if f.nodes[&new_id].scope == structural(f, target) {
+            f.nodes.get_mut(&new_id).unwrap().scope = target;
+        }
+    }
+    // drop groups that ended up empty (innermost first)
+    loop {
+        let empty: Vec<NodeId> = map.values().copied().filter(|g| f.nodes.contains_key(g) && f.members(*g).is_empty()).collect();
+        if empty.is_empty() {
+            break;
+        }
+        for g in empty {
+            f.nodes.remove(&g);
         }
     }
 }
