@@ -423,3 +423,54 @@ fn long_guarded_arms_keep_their_commas() {
     let out = roundtrip(src);
     assert_eq!(run_rust(&out, "arms"), run_rust(src, "arms-orig"));
 }
+
+// ---------------- node -> code line mapping ----------------
+
+#[test]
+fn spans_map_nodes_to_lines() {
+    let src = "fn helper(x: i32) -> i32 {\n    x * 2\n}\n\nfn main() {\n    // say hi\n    let a = helper(4);\n    if a > 5 {\n        println!(\"big {}\", a);\n    } else {\n        println!(\"small\");\n    }\n    let v = vec![1, 2, 3];\n    let total: i32 = v\n        .iter()\n        .map(|n| {\n            let d = n * a;\n            d + 1\n        })\n        .sum();\n    println!(\"{}\", total);\n}\n";
+    let p = parse_program(src).unwrap();
+    let g = generate(&p);
+    let lines: Vec<&str> = g.code.lines().collect();
+    let text = |fi: usize, id: NodeId| {
+        let (a, b) = g.spans[&(fi, id)];
+        lines[a..=b].join("\n")
+    };
+    let fns = p.functions();
+    let main_i = fns.iter().position(|(_, f)| f.name == "main").unwrap();
+    let main = fns[main_i].1;
+    let find = |pred: &dyn Fn(&NodeKind) -> bool| *main.nodes.iter().find(|(_, n)| pred(&n.kind)).unwrap().0;
+    let let_a = find(&|k| matches!(k, NodeKind::Let { name, .. } if name == "a"));
+    assert_eq!(text(main_i, let_a).trim(), "let a = helper(4);");
+    let iff = find(&|k| matches!(k, NodeKind::If));
+    assert!(text(main_i, iff).trim_start().starts_with("if a > 5 {") && text(main_i, iff).trim_end().ends_with('}'), "{}", text(main_i, iff));
+    // a statement inside a closure container
+    let let_d = find(&|k| matches!(k, NodeKind::Let { name, .. } if name == "d"));
+    assert_eq!(text(main_i, let_d).trim(), "let d = n * a;");
+    // the function signature, and the tail of `helper`
+    assert_eq!(text(main_i, main.entry).trim(), "fn main() {");
+    let helper_i = fns.iter().position(|(_, f)| f.name == "helper").unwrap();
+    let helper = fns[helper_i].1;
+    let ret = *helper.nodes.iter().find(|(_, n)| matches!(n.kind, NodeKind::Return)).unwrap().0;
+    assert_eq!(text(helper_i, ret).trim(), "x * 2");
+    // markers never leak and the code is unchanged by them
+    assert!(!g.code.contains("__rn"), "{}", g.code);
+    assert!(g.code.contains("    // say hi\n    let a = helper(4);"), "{}", g.code);
+}
+
+#[test]
+fn spans_nested_tail_values() {
+    // a match arm's value inside a function's tail match
+    let src = "fn classify(n: i32) -> &'static str {\n    match n {\n        0 => \"zero\",\n        _ => {\n            // inside an arm\n            \"many\"\n        }\n    }\n}\nfn main() { println!(\"{}\", classify(3)); }\n";
+    let p = parse_program(src).unwrap();
+    let g = generate(&p);
+    let lines: Vec<&str> = g.code.lines().collect();
+    let f = p.functions()[0].1;
+    let bv = f.nodes.iter().filter(|(_, n)| matches!(n.kind, NodeKind::BlockValue)).map(|(id, _)| *id).collect::<Vec<_>>();
+    let many = bv.iter().find(|id| g.spans.get(&(0, **id)).is_some()).expect("arm value has a span");
+    let (a, b) = g.spans[&(0, *many)];
+    assert_eq!(lines[a..=b].join("\n").trim(), "\"many\"");
+    let ret = *f.nodes.iter().find(|(_, n)| matches!(n.kind, NodeKind::Return)).unwrap().0;
+    let (a, b) = g.spans[&(0, ret)];
+    assert!(lines[a].trim_start().starts_with("match n {") && lines[b].trim() == "}", "{:?}", &lines[a..=b]);
+}

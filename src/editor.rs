@@ -83,7 +83,7 @@ const EXEC_COLOR: Color32 = Color32::from_rgb(235, 235, 235);
 const DATA_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
 const SELECT_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
-fn header_color(c: Category) -> Color32 {
+pub fn header_color(c: Category) -> Color32 {
     match c {
         Category::Entry => Color32::from_rgb(170, 40, 40),
         Category::Flow => Color32::from_rgb(110, 110, 120),
@@ -134,6 +134,24 @@ impl Editor {
         self.clear_selection();
         self.add_menu = None;
         self.needs_fit = true;
+    }
+
+    /// Select a node and open whatever containers / groups it's inside, so it's visible.
+    pub fn reveal(&mut self, f: &FnGraph, id: NodeId) {
+        let mut chain = vec![];
+        let mut s = f.nodes.get(&id).and_then(|n| n.scope);
+        while let Some((owner, hole)) = s {
+            chain.push((owner, hole));
+            s = f.nodes.get(&owner).and_then(|n| n.scope);
+            if chain.len() > 64 {
+                break;
+            }
+        }
+        chain.reverse();
+        if chain != self.view {
+            self.go_to_view(chain);
+        }
+        self.select_only(id);
     }
 
     /// Group the selected nodes. Returns true if a group was made.

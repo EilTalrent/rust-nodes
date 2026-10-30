@@ -4,6 +4,7 @@ mod compiler;
 mod editor;
 mod extract;
 mod graph;
+mod highlight;
 mod layout;
 mod parse;
 mod project;

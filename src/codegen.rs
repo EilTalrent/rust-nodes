@@ -4,12 +4,23 @@
 //! The result is run through `prettyplease` so it reads like hand-written Rust.
 
 use crate::graph::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Generated {
     pub code: String,
     /// Set when the generated text isn't valid Rust syntax (e.g. a broken raw-code node).
     pub error: Option<String>,
+    /// Which lines each statement node became: (function index, node) -> first..=last line (0-based).
+    /// Function index = position in `Program::functions()`.
+    pub spans: HashMap<(usize, NodeId), (usize, usize)>,
+}
+
+/// Parse a span marker "@s3:17" / "@e3:17" / "@f3:0" into (kind, function index, node).
+fn span_marker(text: &str) -> Option<(char, usize, NodeId)> {
+    let rest = text.strip_prefix('@')?;
+    let kind = rest.chars().next()?;
+    let (fi, id) = rest[1..].split_once(':')?;
+    Some((kind, fi.parse().ok()?, id.parse().ok()?))
 }
 
 const MARK: &str = "__rn_comment";
@@ -62,8 +73,31 @@ fn restore_raw(code: &str) -> String {
 }
 
 /// Turn `__rn_comment!("// text");` lines back into comments (see `Gen::comment_lines`).
-fn restore_comments(code: &str) -> String {
+fn restore_comments(code: &str) -> (String, HashMap<(usize, NodeId), (usize, usize)>) {
     let mut out: Vec<String> = vec![];
+    let mut spans: HashMap<(usize, NodeId), (usize, usize)> = HashMap::new();
+    let mut open: HashMap<(usize, NodeId), usize> = HashMap::new();
+    // span markers: record line numbers instead of printing anything
+    let mut mark = |text: &str, out: &Vec<String>, spans: &mut HashMap<(usize, NodeId), (usize, usize)>| -> bool {
+        let Some((kind, fi, id)) = span_marker(text) else { return false };
+        match kind {
+            's' => {
+                open.insert((fi, id), out.len());
+            }
+            'e' => {
+                let end = out.len().saturating_sub(1);
+                let start = open.remove(&(fi, id)).unwrap_or(end).min(end);
+                spans.insert((fi, id), (start, end));
+            }
+            // the function's signature: the line just before its body's first marker
+            'f' => {
+                let l = out.len().saturating_sub(1);
+                spans.insert((fi, id), (l, l));
+            }
+            _ => {}
+        }
+        true
+    };
     // comments flagged '^': they belong after the block's final value, i.e. just before
     // the first later line that's indented less than they are (the block's closing brace)
     let mut pending: Vec<(usize, String)> = vec![];
@@ -71,9 +105,14 @@ fn restore_comments(code: &str) -> String {
     while let Some(line) = lines.next() {
         let t = line.trim_start();
         let indent_len = line.len() - t.len();
-        if !t.is_empty() && !pending.is_empty() && indent_len < pending[0].0 {
-            for (ind, text) in std::mem::take(&mut pending) {
-                push_comment(&mut out, &" ".repeat(ind), &text);
+        // release (innermost first) every pending entry whose block this line closes
+        if !t.is_empty() && pending.iter().any(|(ind, _)| indent_len < *ind) {
+            let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut pending).into_iter().partition(|(ind, _)| indent_len < *ind);
+            pending = keep;
+            for (ind, text) in due {
+                if !mark(&text, &out, &mut spans) {
+                    push_comment(&mut out, &" ".repeat(ind), &text);
+                }
             }
         }
         // statement form `__rn_comment!("..");` or match-arm attribute form `#[__rn_comment("..")]`
@@ -101,14 +140,18 @@ fn restore_comments(code: &str) -> String {
             pending.push((indent.len(), later.to_string()));
             continue;
         }
-        push_comment(&mut out, &indent, &text);
+        if !mark(&text, &out, &mut spans) {
+            push_comment(&mut out, &indent, &text);
+        }
     }
     for (ind, text) in pending {
-        push_comment(&mut out, &" ".repeat(ind), &text);
+        if !mark(&text, &out, &mut spans) {
+            push_comment(&mut out, &" ".repeat(ind), &text);
+        }
     }
     let mut s = out.join("\n");
     s.push('\n');
-    s
+    (s, spans)
 }
 
 /// Add one comment entry to the output lines ("~x" = end of the previous line, "" = blank line).
@@ -151,17 +194,20 @@ pub fn generate(p: &Program) -> Generated {
     match syn::parse_file(&out) {
         Ok(mut file) => {
             syn::visit_mut::VisitMut::visit_file_mut(&mut Shorthand, &mut file);
-            Generated { code: restore_raw(&restore_comments(&finish(&prettyplease::unparse(&file), &notes))), error: None }
+            // raw macros first (they may span lines), then comments and span markers
+            let (code, spans) = restore_comments(&restore_raw(&finish(&prettyplease::unparse(&file), &notes)));
+            Generated { code, error: None, spans }
         }
         Err(e) => {
             let start = e.span().start();
-            Generated { code: out, error: Some(format!("line {}:{}: {e}", start.line, start.column + 1)) }
+            Generated { code: out, error: Some(format!("line {}:{}: {e}", start.line, start.column + 1)), spans: HashMap::new() }
         }
     }
 }
 
 fn gen_items(items: &[Item], out: &mut String, notes: &mut Vec<(Anchor, String)>) {
     let mut k = 0;
+    let mut fi = 0; // function index, same order as Program::functions()
     for it in items {
         match it {
             Item::Comment(c) => notes.push((Anchor::Item(k), c.clone())),
@@ -175,7 +221,8 @@ fn gen_items(items: &[Item], out: &mut String, notes: &mut Vec<(Anchor, String)>
                 k += 1;
             }
             Item::Func(f) => {
-                out.push_str(&gen_fn(f));
+                out.push_str(&gen_fn_at(f, Some(fi)));
+                fi += 1;
                 out.push_str("\n\n");
                 k += 1;
             }
@@ -192,7 +239,8 @@ fn gen_items(items: &[Item], out: &mut String, notes: &mut Vec<(Anchor, String)>
                             j += 1;
                         }
                         Item::Func(f) => {
-                            out.push_str(&gen_fn(f));
+                            out.push_str(&gen_fn_at(f, Some(fi)));
+                            fi += 1;
                             out.push_str("\n\n");
                             j += 1;
                         }
@@ -206,8 +254,17 @@ fn gen_items(items: &[Item], out: &mut String, notes: &mut Vec<(Anchor, String)>
     }
 }
 
+#[allow(dead_code)]
 pub fn gen_fn(f: &FnGraph) -> String {
-    let mut g = Gen { f, out: String::new(), visited: HashSet::new(), container: false };
+    gen_fn_at(f, None)
+}
+
+/// `fi`: the function's index, to tag statements with span markers (None = no markers).
+fn gen_fn_at(f: &FnGraph, fi: Option<usize>) -> String {
+    let mut g = Gen { f, out: String::new(), visited: HashSet::new(), container: false, fi };
+    if let Some(fi) = fi {
+        g.line(&format!("{MARK}!(\"@f{fi}:{}\");", f.entry));
+    }
     let start = f.exec_target(f.entry, 0);
     g.chain(start, true);
     format!("{} {{\n{}}}", f.sig, g.out)
@@ -219,12 +276,21 @@ struct Gen<'a> {
     visited: HashSet<NodeId>,
     /// generating the inside of a container block (not the function body)
     container: bool,
+    /// function index for span markers
+    fi: Option<usize>,
+}
+
+/// The full expression text of a data output (as it appears in the generated code,
+/// up to formatting).
+pub fn expr_text(f: &FnGraph, id: NodeId, pin: usize) -> String {
+    let g = Gen { f, out: String::new(), visited: HashSet::new(), container: false, fi: None };
+    restore_raw(&g.expr(id, pin, 0).0)
 }
 
 /// Short text for whatever feeds a data pin, used to label wires that come from
 /// outside the container being viewed.
 pub fn expr_preview(f: &FnGraph, id: NodeId, pin: usize) -> String {
-    let g = Gen { f, out: String::new(), visited: HashSet::new(), container: false };
+    let g = Gen { f, out: String::new(), visited: HashSet::new(), container: false, fi: None };
     let s = g.expr(id, pin, 0).0.replace('\n', " ");
     if s.chars().count() > 24 { format!("{}…", s.chars().take(23).collect::<String>()) } else { s }
 }
@@ -286,10 +352,15 @@ impl<'a> Gen<'a> {
     }
 
     fn stmt(&mut self, id: NodeId, kind: &NodeKind, last_top: bool) {
-        let (before, after) = match self.f.nodes.get(&id) {
+        let (mut before, mut after) = match self.f.nodes.get(&id) {
             Some(n) => (n.comment.clone(), n.comment_after.clone()),
             None => (String::new(), String::new()),
         };
+        // span markers around the statement (turned into line numbers, never printed)
+        if let Some(fi) = self.fi {
+            before.push_str(&format!("@s{fi}:{id}\n"));
+            after = format!("@e{fi}:{id}\n{after}");
+        }
         self.comment_lines(&before);
         // nothing may follow a block's final value, so its trailing comments go in front,
         // flagged with '^' to be moved to the end of the block afterwards
@@ -528,7 +599,7 @@ impl<'a> Gen<'a> {
 
     fn block_text(&self, id: NodeId, hole: usize, bare_ok: bool) -> String {
         let Some(be) = self.f.block_entry(id, hole) else { return "{}".into() };
-        let mut sub = Gen { f: self.f, out: String::new(), visited: HashSet::new(), container: true };
+        let mut sub = Gen { f: self.f, out: String::new(), visited: HashSet::new(), container: true, fi: self.fi };
         let start = self.f.exec_target(be, 0);
         // a block that's only a value can be written without braces (closure body, match arm),
         // and so can a lone `break` / `continue` / `return x`

@@ -129,12 +129,19 @@ Collapsing a loop or `if` automatically brings along its body and the value node
 * **▶ open** rows / **double-click** a template → go into a container · breadcrumb or **Esc** → back out
 * **Scroll** → zoom
 * **Inspector** (right) edits the selected node: names, operators, argument counts, raw code…
-* **Generated Rust** (right) updates live as you edit
+* **Generated Rust** (right) updates live as you edit, with syntax highlighting. **The selected node's code is highlighted in the node's own colour** (a statement, or just the expression for a value node; every statement for a group), and the panel scrolls to it. **Click a line of code** to select its node: the editor switches function and opens the container / group it's in.
 * A statement's `//` comment is shown above its node; edit it under **Comment** in the inspector
 * **Left panel**: functions in the file, add/delete functions, edit the signature (parameters become Entry outputs)
 * **Check / Run** → `cargo check` / `cargo run`. The file must be inside a cargo project.
 
 Unconnected inputs generate `todo!("unconnected pin")`, so half-finished graphs still compile.
+
+### Code ↔ node colours
+
+![Selecting the purple write! node highlights exactly its code in purple](docs/code-highlight.png)
+![Selecting a group highlights all its statements in the group colour](docs/code-group.png)
+
+How it works: while generating, every statement is wrapped in invisible start/end markers that survive formatting and become a map from node to lines. A value node is found by searching for its expression text inside its statement.
 
 ## Command line
 
@@ -155,6 +162,7 @@ rust-nodes --graph FILE.rs        # print the graph as JSON
 | `src/layout.rs` | node geometry and automatic layout |
 | `src/project.rs` | open/save, layout sidecar, finding the cargo project |
 | `src/extract.rs` | turning a group into a function: parameters, returns, `&mut`, safety checks, type probes |
+| `src/highlight.rs` | Rust syntax highlighter for the code panel, with node-coloured highlight ranges |
 | `src/compiler.rs` | running `cargo check` / `rustc` on a scratch copy and reading types from its errors |
 | `src/editor.rs` | the node canvas and inspector (`egui`) |
 | `src/app.rs` | the app window, panels, running cargo |

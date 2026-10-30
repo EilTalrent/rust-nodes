@@ -5,7 +5,9 @@ use crate::codegen::{generate, Generated};
 use crate::editor::Editor;
 use crate::graph::*;
 use crate::parse::parse_signature;
+use crate::codegen;
 use crate::extract;
+use crate::highlight;
 use crate::project;
 use eframe::egui;
 use std::collections::HashMap;
@@ -46,6 +48,8 @@ struct App {
     has_file: bool,
     /// "Extract function" dialog
     extract: Option<ExtractDialog>,
+    /// what the code view last highlighted (to scroll only when the selection changes)
+    last_marked: Option<(Vec<usize>, std::collections::BTreeSet<NodeId>, usize)>,
     pending_ask: bool,
     /// the "add a Rust source file?" prompt
     show_prompt: bool,
@@ -71,6 +75,7 @@ impl App {
             running: Arc::new(AtomicBool::new(false)),
             has_file: false,
             extract: None,
+            last_marked: None,
             pending_ask: false,
             show_prompt: true,
             prompt_error: None,
@@ -512,6 +517,124 @@ impl App {
     }
 }
 
+impl App {
+    /// Index of the current function in `Program::functions()` (what span markers use).
+    fn current_fi(&self) -> Option<usize> {
+        self.program.functions().iter().position(|(p, _)| *p == self.current)
+    }
+
+    /// Code ranges to paint for the current selection, each in its node's colour.
+    fn selection_marks(&self) -> Vec<(std::ops::Range<usize>, egui::Color32)> {
+        let mut marks = vec![];
+        let (Some(fi), Some(ed)) = (self.current_fi(), self.editors.get(&self.current)) else { return marks };
+        let Some((_, f)) = self.program.functions().into_iter().find(|(p, _)| *p == self.current) else { return marks };
+        let code = &self.code.code;
+        let span_range = |id: NodeId| self.code.spans.get(&(fi, id)).map(|&(a, b)| highlight::line_range(code, a, b));
+        let tint = |c: egui::Color32| egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150);
+        let mut ids: Vec<NodeId> = ed.multi.iter().copied().collect();
+        if ids.is_empty() {
+            ids.extend(ed.selected);
+        }
+        for id in ids {
+            let Some(node) = f.nodes.get(&id) else { continue };
+            let color = tint(crate::editor::header_color(node.kind.category()));
+            if f.is_group(id) {
+                for m in extract::descendants(f, id) {
+                    if let Some(r) = span_range(m) {
+                        marks.push((r, color));
+                    }
+                }
+            } else if let Some(r) = span_range(id) {
+                marks.push((r, color));
+            } else if !node.kind.is_exec() {
+                // a value node: find its text inside the statement that uses it
+                if let Some(stmt) = owning_statement(f, id) {
+                    if let Some(within) = span_range(stmt) {
+                        let text = codegen::expr_text(f, id, 0);
+                        let r = highlight::find_loose(code, within.clone(), &text).unwrap_or(within);
+                        marks.push((r, color));
+                    }
+                }
+            }
+        }
+        marks
+    }
+
+    /// The generated code: syntax highlighted, the selection painted in its node's colour,
+    /// scrolled into view when the selection changes; click a line to select its node.
+    fn code_view(&mut self, ui: &mut egui::Ui) {
+        let marks = self.selection_marks();
+        let key = (self.current.clone(), self.editors.get(&self.current).map(|e| e.multi.clone()).unwrap_or_default(), self.code.code.len());
+        let scroll_to_selection = self.last_marked.as_ref() != Some(&key) && !marks.is_empty();
+        self.last_marked = Some(key);
+        let code = self.code.code.clone();
+        let job = highlight::layout(&code, egui::FontId::monospace(12.5), &marks);
+        let mut clicked_line = None;
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let galley = ui.painter().layout_job(job);
+            let (rect, resp) = ui.allocate_exact_size(galley.size(), egui::Sense::click());
+            ui.painter().galley(rect.min, galley.clone(), egui::Color32::WHITE);
+            if scroll_to_selection {
+                if let Some((r, _)) = marks.first() {
+                    let chars = code[..r.start].chars().count();
+                    let at = galley.pos_from_cursor(egui::text::CCursor::new(chars)).translate(rect.min.to_vec2());
+                    ui.scroll_to_rect(at.expand(30.0), Some(egui::Align::Center));
+                }
+            }
+            if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let c = galley.cursor_from_pos(pos - rect.min);
+                    let byte = code.char_indices().nth(c.index.0).map(|(b, _)| b).unwrap_or(code.len());
+                    clicked_line = Some(code[..byte].matches('\n').count());
+                }
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click a line to select its node");
+        });
+        if let Some(line) = clicked_line {
+            self.select_from_code(line);
+        }
+    }
+
+    /// Select the node whose code contains `line` (the innermost one), switching function if needed.
+    fn select_from_code(&mut self, line: usize) {
+        let best = self
+            .code
+            .spans
+            .iter()
+            .filter(|(_, ab)| ab.0 <= line && line <= ab.1)
+            .min_by_key(|(_, ab)| ab.1 - ab.0)
+            .map(|(&(fi, id), _)| (fi, id));
+        let Some((fi, id)) = best else { return };
+        let fns = self.program.functions();
+        let Some((path, f)) = fns.get(fi) else { return };
+        let path = path.clone();
+        let f = (*f).clone();
+        if path != self.current {
+            self.current = path.clone();
+            self.load_sig();
+        }
+        self.editors.entry(path).or_default().reveal(&f, id);
+    }
+}
+
+/// The statement (exec node) a value node ends up in, following its data wires.
+fn owning_statement(f: &FnGraph, id: NodeId) -> Option<NodeId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([id]);
+    while let Some(n) = queue.pop_front() {
+        if !seen.insert(n) {
+            continue;
+        }
+        for e in f.data.iter().filter(|e| e.from == n) {
+            if f.nodes.get(&e.to).is_some_and(|x| x.kind.is_exec()) {
+                return Some(e.to);
+            }
+            queue.push_back(e.to);
+        }
+    }
+    None
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -668,9 +791,7 @@ impl eframe::App for App {
             if let Some(e) = &self.code.error {
                 ui.colored_label(egui::Color32::from_rgb(230, 120, 100), format!("Syntax error: {e}"));
             }
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&self.code.code).monospace()).wrap_mode(egui::TextWrapMode::Extend));
-            });
+            self.code_view(ui);
         });
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
